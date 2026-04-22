@@ -96,6 +96,7 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
     }, 800);
 
     try {
+      // fal.ai работает синхронно — результат приходит сразу
       const resp = await fetch(TRYON_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -108,37 +109,22 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
       });
       const data = await resp.json();
 
-      if (!resp.ok || !data.id) {
+      clearInterval(prog);
+
+      if (!resp.ok || data.error) {
         throw new Error(data.error || 'Ошибка запуска примерки');
       }
 
-      const predId = data.id;
-      const sessionHash = data.session_hash || predId;
-
-      pollRef.current = setInterval(async () => {
-        const statusResp = await fetch(TRYON_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: 'status', id: predId, session_hash: sessionHash }),
-        });
-        const statusData = await statusResp.json();
-
-        if (statusData.status === 'completed' && statusData.result_url) {
-          clearInterval(pollRef.current!);
-          clearInterval(prog);
-          setProgress(100);
-          setTimeout(() => {
-            setResultUrl(statusData.result_url);
-            setStep('result');
-            setRotate3d({ x: 0, y: 0 });
-          }, 400);
-        } else if (statusData.status === 'failed' || statusData.error) {
-          clearInterval(pollRef.current!);
-          clearInterval(prog);
-          setError(statusData.error || 'Генерация не удалась. Попробуй другое фото.');
-          setStep('upload_person');
-        }
-      }, 2000);
+      if (data.status === 'completed' && data.result_url) {
+        setProgress(100);
+        setTimeout(() => {
+          setResultUrl(data.result_url);
+          setStep('result');
+          setRotate3d({ x: 0, y: 0 });
+        }, 400);
+      } else {
+        throw new Error('Не удалось получить результат. Попробуй снова.');
+      }
 
     } catch (e: unknown) {
       clearInterval(prog);
