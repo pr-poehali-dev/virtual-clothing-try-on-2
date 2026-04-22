@@ -15,15 +15,26 @@ const CATEGORIES: { key: Category; label: string; icon: string }[] = [
   { key: 'one-pieces', label: 'Платье', icon: 'Sparkles' },
 ];
 
-function fileToBase64(file: File): Promise<string> {
+function compressAndBase64(file: File, maxSize = 1024): Promise<string> {
   return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = reader.result as string;
-      resolve(result);
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      let { width, height } = img;
+      if (width > maxSize || height > maxSize) {
+        if (width > height) { height = Math.round(height * maxSize / width); width = maxSize; }
+        else { width = Math.round(width * maxSize / height); height = maxSize; }
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d')!;
+      ctx.drawImage(img, 0, 0, width, height);
+      resolve(canvas.toDataURL('image/jpeg', 0.85));
     };
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
+    img.onerror = reject;
+    img.src = url;
   });
 }
 
@@ -51,17 +62,27 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
 
   const handlePersonUpload = useCallback(async (file: File) => {
     const url = fileToUrl(file);
-    const b64 = await fileToBase64(file);
     setPersonPreview(url);
-    setPersonBase64(b64);
-    setTimeout(() => setStep('upload_garment'), 400);
+    setError(null);
+    try {
+      const b64 = await compressAndBase64(file, 1024);
+      setPersonBase64(b64);
+      setTimeout(() => setStep('upload_garment'), 400);
+    } catch {
+      setError('Не удалось загрузить фото. Попробуй выбрать другое.');
+    }
   }, []);
 
   const handleGarmentUpload = useCallback(async (file: File) => {
     const url = fileToUrl(file);
-    const b64 = await fileToBase64(file);
     setGarmentPreview(url);
-    setGarmentBase64(b64);
+    setError(null);
+    try {
+      const b64 = await compressAndBase64(file, 1024);
+      setGarmentBase64(b64);
+    } catch {
+      setError('Не удалось загрузить фото одежды. Попробуй другое.');
+    }
   }, []);
 
   const startGeneration = useCallback(async () => {
