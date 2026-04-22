@@ -1,844 +1,580 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useCallback, useEffect } from 'react';
 import Icon from '@/components/ui/icon';
 
-const REMOVE_BG_URL = 'https://functions.poehali.dev/30c6090a-e6b1-43f0-86a9-b216df2359d2';
+const TRYON_URL = 'https://functions.poehali.dev/10335c79-d4db-4298-ad61-f7d9b5de3a10';
 
-type CameraStatus = 'idle' | 'requesting' | 'active' | 'denied' | 'error';
-type AppStep = 'upload' | 'processing' | 'tryon';
-type PhotoStatus = 'idle' | 'flash' | 'done';
+type Step = 'upload_person' | 'upload_garment' | 'generating' | 'result';
+type Category = 'tops' | 'bottoms' | 'one-pieces';
 type Lang = 'ru' | 'en';
-
-const T = {
-  ru: {
-    subtitle: 'Примеряй одежду не выходя из дома',
-    uploadBtn: 'Загрузить одежду',
-    uploadHint: 'Фото куртки, платья, рубашки, обуви...',
-    processing: 'Нейросеть вырезает одежду...',
-    processingHint: 'remove.bg убирает фон с фотографии',
-    startCamera: 'Включить камеру',
-    denied: 'Доступ к камере запрещён',
-    deniedHint: 'Разреши доступ в настройках браузера',
-    error: 'Камера недоступна',
-    errorHint: 'Возможно, камера занята другим приложением',
-    retry: 'Повторить',
-    save: 'Сохранить',
-    saved: 'Сохранено!',
-    photoSaved: '✓ Фото сохранено',
-    changeCloth: 'Сменить',
-    poseFound: '● Тело найдено',
-    poseSearch: '○ Поиск тела...',
-    manualMode: 'Ручная настройка',
-    size: 'Размер',
-    position: 'Положение',
-    errBg: 'Не удалось обработать фото. Попробуй другое изображение.',
-    aiHint: 'ИИ уберёт фон → нейросеть наденет одежду на тебя',
-    tips: [
-      '💡 Встань прямо, лицом к камере',
-      '💡 Отойди на 1–2 метра — тело должно быть видно целиком',
-      '💡 Хорошее освещение улучшает точность',
-      '💡 Держи телефон на уровне груди',
-      '💡 Двигайся плавно — нейросеть обновляется каждый кадр',
-    ],
-  },
-  en: {
-    subtitle: 'Try on clothes without leaving home',
-    uploadBtn: 'Upload clothing',
-    uploadHint: 'Photo of jacket, dress, shirt, shoes...',
-    processing: 'AI removing background...',
-    processingHint: 'remove.bg cuts out the clothing',
-    startCamera: 'Start camera',
-    denied: 'Camera access denied',
-    deniedHint: 'Allow access in browser settings',
-    error: 'Camera unavailable',
-    errorHint: 'Another app may be using the camera',
-    retry: 'Retry',
-    save: 'Save',
-    saved: 'Saved!',
-    photoSaved: '✓ Photo saved',
-    changeCloth: 'Change',
-    poseFound: '● Body found',
-    poseSearch: '○ Searching...',
-    manualMode: 'Manual adjustment',
-    size: 'Size',
-    position: 'Position',
-    errBg: 'Could not process photo. Try a different image.',
-    aiHint: 'AI removes background → neural net fits clothing on you',
-    tips: [
-      '💡 Stand straight, facing the camera',
-      '💡 Step back 1–2 m so your full body is visible',
-      '💡 Good lighting improves accuracy',
-      '💡 Hold phone at chest level',
-      '💡 Move smoothly — AI updates every frame',
-    ],
-  },
-};
-
-// Типы одежды и их привязка к точкам тела
-type ClothType =
-  | 'top'       // куртка, свитер, рубашка — от шеи до пояса
-  | 'dress'     // платье — от шеи до колен
-  | 'bottom'    // брюки, юбка — от пояса до ног
-  | 'shoes'     // обувь — ступни
-  | 'hat'       // головной убор — голова
-  | 'accessory' // аксессуары — центр
-
-// MediaPipe landmark индексы
-const LM = {
-  NOSE: 0, LEFT_SHOULDER: 11, RIGHT_SHOULDER: 12,
-  LEFT_HIP: 23, RIGHT_HIP: 24,
-  LEFT_KNEE: 25, RIGHT_KNEE: 26,
-  LEFT_ANKLE: 27, RIGHT_ANKLE: 28,
-};
-
-interface ClothConfig {
-  type: ClothType;
-  label: string;
-  // коэффициенты относительно ширины плеч
-  widthMult: number;   // насколько одежда шире плеч
-  topOffset: number;   // смещение верха выше точки крепления (в долях высоты экрана)
-  bottomAnchor: 'hip' | 'knee' | 'ankle' | 'shoulder';
-}
-
-const CLOTH_CONFIGS: Record<ClothType, ClothConfig> = {
-  top:       { type: 'top',       label: 'Верх',    widthMult: 2.0, topOffset: 0.10, bottomAnchor: 'hip' },
-  dress:     { type: 'dress',     label: 'Платье',  widthMult: 2.1, topOffset: 0.10, bottomAnchor: 'knee' },
-  bottom:    { type: 'bottom',    label: 'Низ',     widthMult: 2.0, topOffset: 0.02, bottomAnchor: 'ankle' },
-  shoes:     { type: 'shoes',     label: 'Обувь',   widthMult: 1.2, topOffset: 0.05, bottomAnchor: 'ankle' },
-  hat:       { type: 'hat',       label: 'Головной убор', widthMult: 1.4, topOffset: 0.12, bottomAnchor: 'shoulder' },
-  accessory: { type: 'accessory', label: 'Аксессуар', widthMult: 1.0, topOffset: 0.0, bottomAnchor: 'shoulder' },
-};
-
-/**
- * Определяет тип одежды по пропорциям изображения (PNG с прозрачным фоном).
- * Анализирует bounding box непрозрачных пикселей через canvas.
- */
-async function classifyClothing(imgSrc: string): Promise<ClothType> {
-  return new Promise(resolve => {
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    img.onload = () => {
-      const canvas = document.createElement('canvas');
-      // Уменьшаем для скорости
-      const scale = Math.min(1, 200 / Math.max(img.width, img.height));
-      canvas.width = Math.round(img.width * scale);
-      canvas.height = Math.round(img.height * scale);
-      const ctx = canvas.getContext('2d')!;
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
-
-      // Находим bounding box непрозрачных пикселей
-      let minX = canvas.width, maxX = 0, minY = canvas.height, maxY = 0;
-      for (let y = 0; y < canvas.height; y++) {
-        for (let x = 0; x < canvas.width; x++) {
-          const alpha = data[(y * canvas.width + x) * 4 + 3];
-          if (alpha > 30) {
-            if (x < minX) minX = x;
-            if (x > maxX) maxX = x;
-            if (y < minY) minY = y;
-            if (y > maxY) maxY = y;
-          }
-        }
-      }
-
-      const bboxW = maxX - minX || canvas.width;
-      const bboxH = maxY - minY || canvas.height;
-      const aspect = bboxW / bboxH; // соотношение ширина/высота
-      // Где находится центр масс непрозрачных пикселей по Y
-      const centerYRel = (minY + bboxH / 2) / canvas.height;
-
-      // Классификация по пропорциям:
-      if (aspect > 2.5) {
-        // Очень широкое — головной убор или аксессуар
-        resolve(centerYRel < 0.4 ? 'hat' : 'accessory');
-      } else if (aspect < 0.5 && bboxH / canvas.height > 0.7) {
-        // Очень высокое и занимает весь кадр — платье
-        resolve('dress');
-      } else if (aspect < 0.7 && centerYRel > 0.55) {
-        // Высокое, центр внизу — брюки или обувь
-        resolve(aspect < 0.4 ? 'shoes' : 'bottom');
-      } else if (aspect > 0.8 && aspect < 2.2 && centerYRel < 0.55) {
-        // Примерно квадратное/широкое, центр вверху/середине — верх
-        resolve('top');
-      } else if (bboxH / canvas.height > 0.5 && aspect < 1.0) {
-        // Высокое — платье
-        resolve('dress');
-      } else {
-        resolve('top'); // по умолчанию
-      }
-    };
-    img.onerror = () => resolve('top');
-    img.src = imgSrc;
-  });
-}
 
 interface TryOnProps { lang?: Lang; }
 
-function lerp(a: number, b: number, t: number) { return a + (b - a) * t; }
+const CATEGORIES: { key: Category; label: string; icon: string }[] = [
+  { key: 'tops', label: 'Верх', icon: 'Shirt' },
+  { key: 'bottoms', label: 'Низ', icon: 'PersonStanding' },
+  { key: 'one-pieces', label: 'Платье', icon: 'Sparkles' },
+];
+
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result as string;
+      resolve(result);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function fileToUrl(file: File): string {
+  return URL.createObjectURL(file);
+}
 
 export default function TryOn({ lang = 'ru' }: TryOnProps) {
-  const t = T[lang];
-
-  const [step, setStep] = useState<AppStep>('upload');
-  const [clothImage, setClothImage] = useState<string | null>(null);
-  const [bgError, setBgError] = useState('');
+  const [step, setStep] = useState<Step>('upload_person');
+  const [personPreview, setPersonPreview] = useState<string | null>(null);
+  const [personBase64, setPersonBase64] = useState<string | null>(null);
+  const [garmentPreview, setGarmentPreview] = useState<string | null>(null);
+  const [garmentBase64, setGarmentBase64] = useState<string | null>(null);
+  const [category, setCategory] = useState<Category>('tops');
+  const [resultUrl, setResultUrl] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [progress, setProgress] = useState(0);
   const [saved, setSaved] = useState(false);
-  const [cameraStatus, setCameraStatus] = useState<CameraStatus>('idle');
-  const [photoStatus, setPhotoStatus] = useState<PhotoStatus>('idle');
-  const [tipIndex, setTipIndex] = useState(0);
-  const [scanning, setScanning] = useState(false);
-  const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user');
-  const [manualSize, setManualSize] = useState(55);
-  const [manualPosY, setManualPosY] = useState(30);
-  const [poseFoundUI, setPoseFoundUI] = useState(false);
-  const [clothType, setClothType] = useState<ClothType>('top');
-  const clothTypeRef = useRef<ClothType>('top');
+  const [rotate3d, setRotate3d] = useState({ x: 0, y: 0 });
+  const [isDragging3d, setIsDragging3d] = useState(false);
+  const drag3dStart = useRef({ x: 0, y: 0, rx: 0, ry: 0 });
+  const personInputRef = useRef<HTMLInputElement>(null);
+  const garmentInputRef = useRef<HTMLInputElement>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Refs — не вызывают ре-рендер, безопасны в RAF
-  const poseActiveRef = useRef(false);
-  const poseResultRef = useRef<{ x: number; y: number; w: number; h: number } | null>(null);
-  const smooth = useRef({ cx: 0.5, cy: 0.15, cw: 0.55, ch: 0.6, ready: false });
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
-  const captureCanvasRef = useRef<HTMLCanvasElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const rafRef = useRef<number>(0);
-  const clothImgRef = useRef<HTMLImageElement | null>(null);
-  const facingModeRef = useRef(facingMode);
-  const manualSizeRef = useRef(manualSize);
-  const manualPosYRef = useRef(manualPosY);
-
-  // Синхронизируем refs со state
-  useEffect(() => { facingModeRef.current = facingMode; }, [facingMode]);
-  useEffect(() => { manualSizeRef.current = manualSize; }, [manualSize]);
-  useEffect(() => { manualPosYRef.current = manualPosY; }, [manualPosY]);
-  useEffect(() => { clothTypeRef.current = clothType; }, [clothType]);
-
-  // Подсказки
-  useEffect(() => {
-    const id = setInterval(() => setTipIndex(i => (i + 1) % t.tips.length), 4000);
-    return () => clearInterval(id);
-  }, [t.tips.length]);
-
-  // Камера
-  const stopCamera = useCallback(() => {
-    cancelAnimationFrame(rafRef.current);
-    streamRef.current?.getTracks().forEach(tr => tr.stop());
-    streamRef.current = null;
-    if (videoRef.current) videoRef.current.srcObject = null;
-    poseActiveRef.current = false;
-    poseResultRef.current = null;
-    smooth.current.ready = false;
-    setPoseFoundUI(false);
+  const handlePersonUpload = useCallback(async (file: File) => {
+    const url = fileToUrl(file);
+    const b64 = await fileToBase64(file);
+    setPersonPreview(url);
+    setPersonBase64(b64);
+    setTimeout(() => setStep('upload_garment'), 400);
   }, []);
 
-  const startCamera = useCallback(async (facing: 'user' | 'environment') => {
-    stopCamera();
-    setCameraStatus('requesting');
-    setScanning(true);
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } },
-        audio: false,
-      });
-      streamRef.current = stream;
-      const video = videoRef.current;
-      if (video) { video.srcObject = stream; await video.play(); }
-      setCameraStatus('active');
-      setTimeout(() => setScanning(false), 1200);
-    } catch (err: unknown) {
-      stopCamera();
-      const e = err as { name?: string };
-      setCameraStatus(e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError' ? 'denied' : 'error');
-      setScanning(false);
-    }
-  }, [stopCamera]);
+  const handleGarmentUpload = useCallback(async (file: File) => {
+    const url = fileToUrl(file);
+    const b64 = await fileToBase64(file);
+    setGarmentPreview(url);
+    setGarmentBase64(b64);
+  }, []);
 
-  useEffect(() => () => stopCamera(), [stopCamera]);
+  const startGeneration = useCallback(async () => {
+    if (!personBase64 || !garmentBase64) return;
+    setStep('generating');
+    setError(null);
+    setProgress(5);
 
-  // MediaPipe Pose — запускаем когда камера активна
-  useEffect(() => {
-    if (cameraStatus !== 'active') return;
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const W = window as any;
-    if (!W.Pose) return; // MediaPipe ещё не загружен — ничего страшного, работает ручной режим
-
-    let pose: { send: (d: { image: HTMLVideoElement }) => Promise<void>; close: () => void } | null = null;
-    let destroyed = false;
+    const prog = setInterval(() => {
+      setProgress(p => p < 85 ? p + Math.random() * 4 : p);
+    }, 800);
 
     try {
-      pose = new W.Pose({
-        locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`,
+      const resp = await fetch(TRYON_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'run',
+          model_image: personBase64,
+          garment_image: garmentBase64,
+          category,
+        }),
       });
+      const data = await resp.json();
 
-      pose!.setOptions({
-        modelComplexity: 1,
-        smoothLandmarks: true,
-        enableSegmentation: false,
-        minDetectionConfidence: 0.5,
-        minTrackingConfidence: 0.5,
-      });
-
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (pose as any).onResults((results: any) => {
-        if (destroyed) return;
-        const lm = results.poseLandmarks;
-        if (!lm || lm.length < 25) {
-          poseActiveRef.current = false;
-          poseResultRef.current = null;
-          setPoseFoundUI(false);
-          return;
-        }
-        const ls = lm[LM.LEFT_SHOULDER];  const rs = lm[LM.RIGHT_SHOULDER];
-        const lh = lm[LM.LEFT_HIP];       const rh = lm[LM.RIGHT_HIP];
-        const lk = lm[LM.LEFT_KNEE];      const rk = lm[LM.RIGHT_KNEE];
-        const la = lm[LM.LEFT_ANKLE];     const ra = lm[LM.RIGHT_ANKLE];
-        const nose = lm[LM.NOSE];
-
-        if ((ls.visibility ?? 0) < 0.25 || (rs.visibility ?? 0) < 0.25) {
-          poseActiveRef.current = false;
-          poseResultRef.current = null;
-          setPoseFoundUI(false);
-          return;
-        }
-
-        const shoulderW = Math.abs(ls.x - rs.x);
-        const centerX = (ls.x + rs.x) / 2;
-        const cfg = CLOTH_CONFIGS[clothTypeRef.current];
-        const clothW = Math.max(shoulderW * cfg.widthMult, 0.4);
-
-        const hVis  = Math.min(lh.visibility ?? 0, rh.visibility ?? 0);
-        const kVis  = Math.min(lk.visibility ?? 0, rk.visibility ?? 0);
-        const aVis  = Math.min(la.visibility ?? 0, ra.visibility ?? 0);
-        const hipY  = hVis  > 0.2 ? (lh.y + rh.y) / 2   : null;
-        const kneeY = kVis  > 0.2 ? (lk.y + rk.y) / 2   : null;
-        const ankleY = aVis > 0.2 ? (la.y + ra.y) / 2   : null;
-        const shoulderY = (ls.y + rs.y) / 2;
-
-        // Верхний край одежды зависит от типа
-        let topY: number;
-        let bottomY: number;
-
-        switch (clothTypeRef.current) {
-          case 'hat':
-            // Шапка: от верха головы (выше носа) до плеч
-            topY = Math.min(ls.y, rs.y) - shoulderW * 1.2;
-            bottomY = shoulderY;
-            break;
-          case 'top':
-          default:
-            // Куртка/свитер/рубашка: от шеи до бёдер
-            topY = Math.min(ls.y, rs.y) - shoulderW * cfg.topOffset * 3;
-            bottomY = hipY ? hipY + 0.04 : shoulderY + shoulderW * 1.8;
-            break;
-          case 'dress':
-            // Платье: от шеи до колен
-            topY = Math.min(ls.y, rs.y) - shoulderW * cfg.topOffset * 3;
-            bottomY = kneeY ? kneeY + 0.05 : (hipY ? hipY + shoulderW * 1.2 : shoulderY + shoulderW * 2.5);
-            break;
-          case 'bottom':
-            // Брюки/юбка: от бёдер до лодыжек
-            topY = hipY ? hipY - 0.03 : shoulderY + shoulderW * 1.2;
-            bottomY = ankleY ? ankleY + 0.04 : (kneeY ? kneeY + shoulderW * 1.0 : topY + shoulderW * 2.5);
-            break;
-          case 'shoes':
-            // Обувь: у лодыжек
-            topY = ankleY ? ankleY - 0.06 : (kneeY ? kneeY + shoulderW * 0.8 : shoulderY + shoulderW * 2.5);
-            bottomY = topY + shoulderW * 0.6;
-            break;
-          case 'accessory':
-            // Аксессуар: центр груди
-            topY = shoulderY - shoulderW * 0.1;
-            bottomY = hipY ? (hipY + shoulderY) / 2 : shoulderY + shoulderW * 0.8;
-            break;
-        }
-
-        // Для головных уборов/обуви используем координату носа/ступни
-        if (clothTypeRef.current === 'hat' && nose) {
-          topY = nose.y - shoulderW * 0.9;
-        }
-
-        const bodyH = Math.max(bottomY - topY, shoulderW * 0.5);
-
-        poseResultRef.current = { x: centerX, y: topY, w: clothW, h: bodyH };
-        poseActiveRef.current = true;
-        setPoseFoundUI(true);
-      });
-    } catch {
-      return; // MediaPipe недоступен — работаем в ручном режиме
-    }
-
-    const video = videoRef.current;
-    const poseInterval = setInterval(async () => {
-      if (destroyed || !video || video.readyState < 2 || !streamRef.current) return;
-      try { await pose!.send({ image: video }); } catch { /* ignore */ }
-    }, 120);
-
-    return () => {
-      destroyed = true;
-      clearInterval(poseInterval);
-      try { pose?.close(); } catch { /* ignore */ }
-    };
-  }, [cameraStatus]);
-
-  // RAF цикл — рисует одежду на overlay canvas
-  useEffect(() => {
-    if (cameraStatus !== 'active') return;
-
-    const video = videoRef.current;
-    const canvas = overlayCanvasRef.current;
-    if (!video || !canvas) return;
-
-    const render = () => {
-      rafRef.current = requestAnimationFrame(render);
-      if (video.readyState < 2) return;
-      const vw = video.videoWidth;
-      const vh = video.videoHeight;
-      if (!vw || !vh) return;
-      if (canvas.width !== vw) canvas.width = vw;
-      if (canvas.height !== vh) canvas.height = vh;
-
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-      ctx.clearRect(0, 0, vw, vh);
-
-      const clothEl = clothImgRef.current;
-      if (!clothEl?.complete || !clothEl.naturalWidth) return;
-
-      let tx: number, ty: number, tw: number;
-
-      const pr = poseResultRef.current;
-      const isMirrored = facingModeRef.current === 'user';
-
-      if (pr && poseActiveRef.current) {
-        const s = smooth.current;
-        const speed = s.ready ? 0.14 : 0.75;
-        s.cx = lerp(s.cx, pr.x, speed);
-        s.cy = lerp(s.cy, pr.y, speed);
-        s.cw = lerp(s.cw, pr.w, speed);
-        s.ch = lerp(s.ch, pr.h, speed);
-        s.ready = true;
-
-        tw = s.cw * vw;
-        ty = s.cy * vh;
-
-        // MediaPipe даёт координаты как в оригинальном (незеркальном) видео.
-        // Canvas НЕ зеркалится через CSS — рисуем сами с учётом зеркала.
-        // centerX = s.cx (центр в 0-1). При зеркале: x_mirrored = 1 - centerX
-        const centerXpx = isMirrored ? (1 - s.cx) * vw : s.cx * vw;
-        tx = centerXpx - tw / 2;
-      } else {
-        tw = vw * (0.45 + manualSizeRef.current * 0.004);
-        tx = (vw - tw) / 2;
-        ty = vh * (manualPosYRef.current / 100);
+      if (!resp.ok || !data.id) {
+        throw new Error(data.error || 'Ошибка запуска примерки');
       }
 
-      const aspect = clothEl.naturalWidth / clothEl.naturalHeight;
-      const drawH = tw / aspect;
-      const sway = Math.sin(Date.now() / 1800) * 0.013;
+      const predId = data.id;
 
-      // Мягкая тень под одеждой
-      ctx.save();
-      ctx.globalAlpha = 0.2;
-      ctx.filter = 'blur(10px)';
-      ctx.drawImage(clothEl, tx + tw * 0.1, ty + drawH * 0.92, tw * 0.8, drawH * 0.1);
-      ctx.restore();
-
-      // Одежда с покачиванием
-      ctx.save();
-      ctx.translate(tx + tw / 2, ty);
-      ctx.rotate(sway);
-      ctx.shadowColor = 'rgba(0,0,0,0.55)';
-      ctx.shadowBlur = 16;
-      ctx.shadowOffsetY = 5;
-      ctx.drawImage(clothEl, -tw / 2, 0, tw, drawH);
-      ctx.restore();
-    };
-
-    render();
-    return () => cancelAnimationFrame(rafRef.current);
-  }, [cameraStatus]); // только cameraStatus — всё остальное через refs
-
-  // Загрузка фото
-  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setBgError('');
-    setStep('processing');
-    const reader = new FileReader();
-    reader.onload = async (ev) => {
-      const b64 = ev.target?.result as string;
-      try {
-        const res = await fetch(REMOVE_BG_URL, {
+      pollRef.current = setInterval(async () => {
+        const statusResp = await fetch(TRYON_URL, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ image: b64 }),
+          body: JSON.stringify({ action: 'status', id: predId }),
         });
-        const data = await res.json();
-        if (data.ok && data.image) {
-          // Классифицируем одежду по форме PNG
-          const detectedType = await classifyClothing(data.image);
-          setClothType(detectedType);
-          clothTypeRef.current = detectedType;
+        const statusData = await statusResp.json();
 
-          const img = new Image();
-          img.onload = () => { clothImgRef.current = img; };
-          img.src = data.image;
-          setClothImage(data.image);
-          setStep('tryon');
-          setCameraStatus('idle');
-          smooth.current.ready = false;
-          poseResultRef.current = null;
-        } else {
-          setBgError(t.errBg);
-          setStep('upload');
+        if (statusData.status === 'completed' && statusData.result_url) {
+          clearInterval(pollRef.current!);
+          clearInterval(prog);
+          setProgress(100);
+          setTimeout(() => {
+            setResultUrl(statusData.result_url);
+            setStep('result');
+            setRotate3d({ x: 0, y: 0 });
+          }, 400);
+        } else if (statusData.status === 'failed' || statusData.error) {
+          clearInterval(pollRef.current!);
+          clearInterval(prog);
+          setError(statusData.error || 'Генерация не удалась. Попробуй другое фото.');
+          setStep('upload_person');
         }
-      } catch {
-        setBgError(t.errBg);
-        setStep('upload');
-      }
-    };
-    reader.readAsDataURL(file);
-    e.target.value = '';
-  };
+      }, 2000);
 
-  const handleFlip = () => {
-    const next = facingMode === 'user' ? 'environment' : 'user';
-    setFacingMode(next);
-    poseResultRef.current = null;
-    smooth.current.ready = false;
-    startCamera(next);
-  };
-
-  const handleSave = () => { setSaved(true); setTimeout(() => setSaved(false), 2000); };
-
-  const handlePhoto = useCallback(() => {
-    const video = videoRef.current;
-    const overlay = overlayCanvasRef.current;
-    const canvas = captureCanvasRef.current;
-    if (!video || !canvas) return;
-    const w = video.videoWidth || 640;
-    const h = video.videoHeight || 480;
-    canvas.width = w; canvas.height = h;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    const mirrored = facingModeRef.current === 'user';
-    // Рисуем видео (зеркалим для фронтальной камеры)
-    if (mirrored) { ctx.translate(w, 0); ctx.scale(-1, 1); }
-    ctx.drawImage(video, 0, 0, w, h);
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    // Overlay canvas уже содержит одежду с правильными координатами — просто накладываем
-    if (overlay) {
-      ctx.drawImage(overlay, 0, 0, w, h);
+    } catch (e: unknown) {
+      clearInterval(prog);
+      setError(e instanceof Error ? e.message : 'Произошла ошибка');
+      setStep('upload_person');
     }
-    setPhotoStatus('flash');
-    setTimeout(() => setPhotoStatus('done'), 180);
-    setTimeout(() => setPhotoStatus('idle'), 2500);
-    canvas.toBlob(blob => {
-      if (!blob) return;
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url; a.download = `fitar-${Date.now()}.jpg`; a.click();
-      URL.revokeObjectURL(url);
-    }, 'image/jpeg', 0.92);
+  }, [personBase64, garmentBase64, category]);
+
+  useEffect(() => {
+    return () => { if (pollRef.current) clearInterval(pollRef.current); };
   }, []);
 
-  const sizeLabel = manualSize < 30 ? 'XS' : manualSize < 46 ? 'S' : manualSize < 62 ? 'M' : manualSize < 78 ? 'L' : 'XL';
+  const handleSave = useCallback(async () => {
+    if (!resultUrl) return;
+    try {
+      const resp = await fetch(TRYON_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'save', image_url: resultUrl }),
+      });
+      const data = await resp.json();
+      if (data.saved_url) {
+        const saved_items = JSON.parse(localStorage.getItem('tryon_history') || '[]');
+        saved_items.unshift({ url: data.saved_url, date: new Date().toISOString() });
+        localStorage.setItem('tryon_history', JSON.stringify(saved_items.slice(0, 50)));
+      }
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch (_) { /* ignore */ }
+  }, [resultUrl]);
 
-  const resetToUpload = () => {
-    stopCamera();
-    setStep('upload');
-    setClothImage(null);
-    setCameraStatus('idle');
-    clothImgRef.current = null;
-    poseResultRef.current = null;
+  const onMouse3dDown = (e: React.MouseEvent) => {
+    setIsDragging3d(true);
+    drag3dStart.current = { x: e.clientX, y: e.clientY, rx: rotate3d.x, ry: rotate3d.y };
+  };
+  const onMouse3dMove = (e: React.MouseEvent) => {
+    if (!isDragging3d) return;
+    const dx = e.clientX - drag3dStart.current.x;
+    const dy = e.clientY - drag3dStart.current.y;
+    setRotate3d({ x: drag3dStart.current.rx - dy * 0.3, y: drag3dStart.current.ry + dx * 0.3 });
+  };
+  const onMouse3dUp = () => setIsDragging3d(false);
+
+  const onTouch3dStart = (e: React.TouchEvent) => {
+    const t = e.touches[0];
+    drag3dStart.current = { x: t.clientX, y: t.clientY, rx: rotate3d.x, ry: rotate3d.y };
+  };
+  const onTouch3dMove = (e: React.TouchEvent) => {
+    const t = e.touches[0];
+    const dx = t.clientX - drag3dStart.current.x;
+    const dy = t.clientY - drag3dStart.current.y;
+    setRotate3d({ x: drag3dStart.current.rx - dy * 0.3, y: drag3dStart.current.ry + dx * 0.3 });
+  };
+
+  const reset = () => {
+    setStep('upload_person');
+    setPersonPreview(null);
+    setPersonBase64(null);
+    setGarmentPreview(null);
+    setGarmentBase64(null);
+    setResultUrl(null);
+    setError(null);
+    setSaved(false);
+    setProgress(0);
   };
 
   return (
-    <div className="flex flex-col h-full relative">
-      <canvas ref={captureCanvasRef} className="hidden" />
-      <input ref={fileInputRef} type="file" accept="image/*" className="hidden" onChange={handleFileSelect} />
-
+    <div style={{ minHeight: '100%', padding: '0 0 16px', display: 'flex', flexDirection: 'column' }}>
       {/* Заголовок */}
-      <div className="px-5 pt-5 pb-3 flex items-center justify-between flex-shrink-0 animate-fade-in-up">
-        <div>
-          <h1 className="font-montserrat font-900 text-2xl text-white leading-tight">
-            {lang === 'ru' ? <>AR <span className="text-gradient">Примерочная</span></> : <><span className="text-gradient">AR</span> Fitting</>}
-          </h1>
-          <p className="text-xs mt-0.5 transition-colors duration-500"
-            style={{ color: poseFoundUI ? '#4ade80' : 'rgba(255,255,255,0.4)' }}>
-            {cameraStatus === 'active' ? (poseFoundUI ? t.poseFound : t.poseSearch) : t.subtitle}
-          </p>
+      <div style={{ padding: '20px 20px 0', textAlign: 'center' }}>
+        <div style={{
+          display: 'inline-flex', alignItems: 'center', gap: 8, marginBottom: 6,
+          background: 'linear-gradient(135deg, rgba(168,85,247,0.15), rgba(6,182,212,0.15))',
+          border: '1px solid rgba(168,85,247,0.3)', borderRadius: 20, padding: '4px 14px',
+        }}>
+          <div style={{ width: 6, height: 6, borderRadius: '50%', background: '#a855f7', animation: 'pulse 2s infinite' }} />
+          <span style={{ fontSize: 11, color: '#c084fc', fontWeight: 600, letterSpacing: 1 }}>AI ПРИМЕРКА</span>
         </div>
-        {step === 'tryon' && (
-          <button onClick={resetToUpload} className="glass rounded-2xl px-3 py-2 flex items-center gap-1.5">
-            <Icon name="Upload" size={13} className="text-purple-400" />
-            <span className="text-xs text-white/60 font-600">{t.changeCloth}</span>
-          </button>
-        )}
+        <h1 style={{ fontSize: 22, fontWeight: 700, color: '#fff', margin: 0, lineHeight: 1.2 }}>
+          Виртуальная примерка
+        </h1>
+        <p style={{ fontSize: 13, color: 'rgba(255,255,255,0.4)', margin: '4px 0 0' }}>
+          Загрузи фото себя и одежды — ИИ наденет её на тебя
+        </p>
       </div>
 
-      {/* ШАГ 1: Загрузка */}
-      {step === 'upload' && (
-        <div className="flex-1 flex flex-col items-center justify-center px-6 gap-5 animate-scale-in pb-16">
-          <div className="w-36 h-36 rounded-3xl glass flex items-center justify-center animate-float"
-            style={{ border: '2px solid rgba(168,85,247,0.4)' }}>
-            <span className="text-6xl">👗</span>
-          </div>
-          <div className="text-center">
-            <h2 className="font-montserrat font-800 text-xl text-white mb-1">{t.uploadBtn}</h2>
-            <p className="text-sm text-white/40">{t.uploadHint}</p>
-          </div>
-          {bgError && (
-            <div className="glass rounded-2xl px-4 py-3 w-full text-center text-sm"
-              style={{ border: '1px solid rgba(239,68,68,0.3)', color: '#f87171' }}>
-              {bgError}
+      {/* Шаги-индикатор */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 0, padding: '16px 20px 0' }}>
+        {(['upload_person', 'upload_garment', 'generating', 'result'] as Step[]).map((s, i) => {
+          const labels = ['Ты', 'Одежда', 'ИИ', 'Результат'];
+          const isActive = step === s;
+          const isDone = (['upload_person', 'upload_garment', 'generating', 'result'] as Step[]).indexOf(step) > i;
+          return (
+            <div key={s} style={{ display: 'flex', alignItems: 'center' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+                <div style={{
+                  width: 28, height: 28, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  fontSize: 12, fontWeight: 700, transition: 'all 0.3s',
+                  background: isDone ? '#a855f7' : isActive ? 'linear-gradient(135deg, #a855f7, #06b6d4)' : 'rgba(255,255,255,0.08)',
+                  border: isActive ? '2px solid rgba(168,85,247,0.8)' : '2px solid transparent',
+                  color: isDone || isActive ? '#fff' : 'rgba(255,255,255,0.3)',
+                  boxShadow: isActive ? '0 0 12px rgba(168,85,247,0.5)' : 'none',
+                }}>
+                  {isDone ? '✓' : i + 1}
+                </div>
+                <span style={{ fontSize: 10, color: isActive ? '#c084fc' : 'rgba(255,255,255,0.25)', whiteSpace: 'nowrap' }}>
+                  {labels[i]}
+                </span>
+              </div>
+              {i < 3 && (
+                <div style={{ width: 40, height: 2, margin: '0 4px', marginBottom: 16, borderRadius: 2, background: isDone ? '#a855f7' : 'rgba(255,255,255,0.1)', transition: 'all 0.3s' }} />
+              )}
             </div>
+          );
+        })}
+      </div>
+
+      {/* Ошибка */}
+      {error && (
+        <div style={{ margin: '12px 20px 0', padding: '12px 14px', borderRadius: 12, background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)' }}>
+          <p style={{ margin: 0, fontSize: 13, color: '#f87171' }}>{error}</p>
+        </div>
+      )}
+
+      {/* ШАГ 1: Загрузка фото себя */}
+      {step === 'upload_person' && (
+        <div style={{ flex: 1, padding: '16px 20px 0', display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <input ref={personInputRef} type="file" accept="image/*" style={{ display: 'none' }}
+            onChange={e => e.target.files?.[0] && handlePersonUpload(e.target.files[0])} />
+
+          <div
+            onClick={() => personInputRef.current?.click()}
+            style={{
+              flex: 1, minHeight: 280, borderRadius: 20, cursor: 'pointer', position: 'relative', overflow: 'hidden',
+              border: `2px dashed ${personPreview ? 'rgba(168,85,247,0.5)' : 'rgba(255,255,255,0.15)'}`,
+              background: personPreview ? 'transparent' : 'rgba(255,255,255,0.03)',
+              transition: 'all 0.3s', display: 'flex', alignItems: 'center', justifyContent: 'center',
+            }}
+          >
+            {personPreview ? (
+              <img src={personPreview} alt="person" style={{ width: '100%', height: '100%', objectFit: 'cover', borderRadius: 18 }} />
+            ) : (
+              <div style={{ textAlign: 'center', padding: 24 }}>
+                <div style={{
+                  width: 72, height: 72, borderRadius: '50%', margin: '0 auto 16px',
+                  background: 'linear-gradient(135deg, rgba(168,85,247,0.2), rgba(6,182,212,0.2))',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  border: '1px solid rgba(168,85,247,0.3)',
+                }}>
+                  <Icon name="User" size={32} style={{ color: '#a855f7' }} />
+                </div>
+                <p style={{ margin: 0, fontSize: 16, fontWeight: 600, color: '#fff' }}>Загрузи своё фото</p>
+                <p style={{ margin: '6px 0 0', fontSize: 12, color: 'rgba(255,255,255,0.4)', lineHeight: 1.5 }}>
+                  Встань прямо, в полный рост<br />На однотонном фоне — лучший результат
+                </p>
+              </div>
+            )}
+            {personPreview && (
+              <div style={{
+                position: 'absolute', bottom: 12, left: '50%', transform: 'translateX(-50%)',
+                background: 'rgba(168,85,247,0.9)', borderRadius: 20, padding: '6px 16px',
+                fontSize: 12, color: '#fff', fontWeight: 600, whiteSpace: 'nowrap',
+              }}>
+                Нажми чтобы изменить
+              </div>
+            )}
+          </div>
+
+          <div style={{ padding: '12px 14px', borderRadius: 14, background: 'rgba(168,85,247,0.08)', border: '1px solid rgba(168,85,247,0.15)' }}>
+            <p style={{ margin: 0, fontSize: 12, color: 'rgba(255,255,255,0.5)', lineHeight: 1.6 }}>
+              💡 <strong style={{ color: 'rgba(255,255,255,0.7)' }}>Советы для лучшего результата:</strong><br />
+              • Фото в полный рост, стой прямо<br />
+              • Руки опущены вдоль тела<br />
+              • Хорошее освещение, чёткое фото
+            </p>
+          </div>
+
+          {personPreview && (
+            <button
+              onClick={() => setStep('upload_garment')}
+              style={{
+                padding: '14px 20px', borderRadius: 16, border: 'none', cursor: 'pointer', fontWeight: 700, fontSize: 15,
+                background: 'linear-gradient(135deg, #a855f7, #06b6d4)', color: '#fff',
+                boxShadow: '0 4px 20px rgba(168,85,247,0.4)',
+              }}
+            >
+              Далее — выбрать одежду →
+            </button>
           )}
-          <button onClick={() => fileInputRef.current?.click()}
-            className="btn-primary px-8 py-4 font-montserrat font-700 text-base flex items-center gap-3 rounded-2xl w-full justify-center">
-            <Icon name="ImagePlus" size={22} className="text-white" />
-            {t.uploadBtn}
-          </button>
-          <p className="text-xs text-white/20 text-center">{t.aiHint}</p>
-          <div className="absolute bottom-3 left-4 right-4">
-            <div className="glass rounded-xl px-4 py-2.5 text-center">
-              <p className="text-xs text-white/40">{t.tips[tipIndex]}</p>
+        </div>
+      )}
+
+      {/* ШАГ 2: Загрузка одежды */}
+      {step === 'upload_garment' && (
+        <div style={{ flex: 1, padding: '16px 20px 0', display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <input ref={garmentInputRef} type="file" accept="image/*" style={{ display: 'none' }}
+            onChange={e => e.target.files?.[0] && handleGarmentUpload(e.target.files[0])} />
+
+          {/* Категория */}
+          <div style={{ display: 'flex', gap: 8 }}>
+            {CATEGORIES.map(cat => (
+              <button
+                key={cat.key}
+                onClick={() => setCategory(cat.key)}
+                style={{
+                  flex: 1, padding: '10px 4px', borderRadius: 12, border: 'none', cursor: 'pointer', fontWeight: 600, fontSize: 12,
+                  transition: 'all 0.2s',
+                  background: category === cat.key ? 'linear-gradient(135deg, rgba(168,85,247,0.4), rgba(6,182,212,0.4))' : 'rgba(255,255,255,0.06)',
+                  color: category === cat.key ? '#fff' : 'rgba(255,255,255,0.4)',
+                  boxShadow: category === cat.key ? '0 0 12px rgba(168,85,247,0.3)' : 'none',
+                  border: category === cat.key ? '1px solid rgba(168,85,247,0.5)' : '1px solid transparent',
+                }}
+              >
+                {cat.label}
+              </button>
+            ))}
+          </div>
+
+          <div
+            onClick={() => garmentInputRef.current?.click()}
+            style={{
+              flex: 1, minHeight: 260, borderRadius: 20, cursor: 'pointer', position: 'relative', overflow: 'hidden',
+              border: `2px dashed ${garmentPreview ? 'rgba(6,182,212,0.5)' : 'rgba(255,255,255,0.15)'}`,
+              background: garmentPreview ? 'transparent' : 'rgba(255,255,255,0.03)',
+              transition: 'all 0.3s', display: 'flex', alignItems: 'center', justifyContent: 'center',
+            }}
+          >
+            {garmentPreview ? (
+              <img src={garmentPreview} alt="garment" style={{ width: '100%', height: '100%', objectFit: 'contain', padding: 12 }} />
+            ) : (
+              <div style={{ textAlign: 'center', padding: 24 }}>
+                <div style={{
+                  width: 72, height: 72, borderRadius: '50%', margin: '0 auto 16px',
+                  background: 'linear-gradient(135deg, rgba(6,182,212,0.2), rgba(168,85,247,0.2))',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  border: '1px solid rgba(6,182,212,0.3)',
+                }}>
+                  <Icon name="Shirt" size={32} style={{ color: '#06b6d4' }} />
+                </div>
+                <p style={{ margin: 0, fontSize: 16, fontWeight: 600, color: '#fff' }}>Загрузи фото одежды</p>
+                <p style={{ margin: '6px 0 0', fontSize: 12, color: 'rgba(255,255,255,0.4)', lineHeight: 1.5 }}>
+                  Фото с магазина или личное фото<br />Лучше на белом фоне
+                </p>
+              </div>
+            )}
+            {garmentPreview && (
+              <div style={{
+                position: 'absolute', bottom: 12, left: '50%', transform: 'translateX(-50%)',
+                background: 'rgba(6,182,212,0.9)', borderRadius: 20, padding: '6px 16px',
+                fontSize: 12, color: '#fff', fontWeight: 600, whiteSpace: 'nowrap',
+              }}>
+                Нажми чтобы изменить
+              </div>
+            )}
+          </div>
+
+          {/* Превью двух фото */}
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+            <div style={{ flex: 1, position: 'relative', height: 64, borderRadius: 12, overflow: 'hidden', background: 'rgba(255,255,255,0.05)' }}>
+              {personPreview && <img src={personPreview} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />}
+              <div style={{ position: 'absolute', bottom: 4, left: 4, fontSize: 10, color: 'rgba(255,255,255,0.6)', background: 'rgba(0,0,0,0.5)', borderRadius: 6, padding: '2px 6px' }}>Ты</div>
             </div>
+            <Icon name="Plus" size={16} style={{ color: 'rgba(255,255,255,0.3)', flexShrink: 0 }} />
+            <div style={{ flex: 1, height: 64, borderRadius: 12, overflow: 'hidden', background: 'rgba(255,255,255,0.05)', display: 'flex', alignItems: 'center', justifyContent: 'center', position: 'relative' }}>
+              {garmentPreview
+                ? <img src={garmentPreview} style={{ width: '100%', height: '100%', objectFit: 'contain' }} />
+                : <Icon name="Shirt" size={20} style={{ color: 'rgba(255,255,255,0.2)' }} />
+              }
+              {garmentPreview && <div style={{ position: 'absolute', bottom: 4, left: 4, fontSize: 10, color: 'rgba(255,255,255,0.6)', background: 'rgba(0,0,0,0.5)', borderRadius: 6, padding: '2px 6px' }}>Одежда</div>}
+            </div>
+            <Icon name="ArrowRight" size={16} style={{ color: 'rgba(255,255,255,0.3)', flexShrink: 0 }} />
+            <div style={{ flex: 1, height: 64, borderRadius: 12, background: 'linear-gradient(135deg, rgba(168,85,247,0.1), rgba(6,182,212,0.1))', display: 'flex', alignItems: 'center', justifyContent: 'center', border: '1px dashed rgba(168,85,247,0.3)' }}>
+              <Icon name="Sparkles" size={20} style={{ color: 'rgba(168,85,247,0.6)' }} />
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', gap: 10 }}>
+            <button
+              onClick={() => setStep('upload_person')}
+              style={{
+                padding: '14px', borderRadius: 16, border: '1px solid rgba(255,255,255,0.1)', cursor: 'pointer', fontWeight: 600, fontSize: 14,
+                background: 'rgba(255,255,255,0.05)', color: 'rgba(255,255,255,0.6)',
+              }}
+            >
+              ← Назад
+            </button>
+            <button
+              disabled={!garmentPreview}
+              onClick={startGeneration}
+              style={{
+                flex: 1, padding: '14px', borderRadius: 16, border: 'none', cursor: garmentPreview ? 'pointer' : 'not-allowed', fontWeight: 700, fontSize: 15,
+                background: garmentPreview ? 'linear-gradient(135deg, #a855f7, #06b6d4)' : 'rgba(255,255,255,0.08)',
+                color: garmentPreview ? '#fff' : 'rgba(255,255,255,0.3)',
+                boxShadow: garmentPreview ? '0 4px 20px rgba(168,85,247,0.4)' : 'none',
+                transition: 'all 0.3s',
+              }}
+            >
+              ✨ Примерить
+            </button>
           </div>
         </div>
       )}
 
-      {/* ШАГ 2: Обработка */}
-      {step === 'processing' && (
-        <div className="flex-1 flex flex-col items-center justify-center gap-6 animate-scale-in">
-          <div className="relative w-28 h-28">
-            <div className="absolute inset-0 rounded-full border-2 border-purple-500/20 border-t-purple-500 animate-spin" />
-            <div className="absolute inset-3 rounded-full border-2 border-cyan-500/20 border-b-cyan-400 animate-spin"
-              style={{ animationDirection: 'reverse', animationDuration: '1.4s' }} />
-            <div className="absolute inset-0 flex items-center justify-center text-3xl">✂️</div>
+      {/* ШАГ 3: Генерация */}
+      {step === 'generating' && (
+        <div style={{ flex: 1, padding: '24px 20px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 24 }}>
+          <div style={{ position: 'relative', width: 120, height: 120 }}>
+            <div style={{
+              position: 'absolute', inset: 0, borderRadius: '50%',
+              background: 'conic-gradient(from 0deg, #a855f7, #06b6d4, #a855f7)',
+              animation: 'spin 2s linear infinite',
+            }} />
+            <div style={{
+              position: 'absolute', inset: 6, borderRadius: '50%', background: '#080b14',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+            }}>
+              <Icon name="Sparkles" size={36} style={{ color: '#a855f7' }} />
+            </div>
           </div>
-          <div className="text-center px-8">
-            <p className="font-montserrat font-700 text-white text-lg">{t.processing}</p>
-            <p className="text-sm text-white/40 mt-1">{t.processingHint}</p>
+
+          <div style={{ textAlign: 'center' }}>
+            <h2 style={{ margin: 0, fontSize: 20, fontWeight: 700, color: '#fff' }}>ИИ примеряет одежду</h2>
+            <p style={{ margin: '8px 0 0', fontSize: 13, color: 'rgba(255,255,255,0.4)' }}>Нейросеть анализирует фото...<br />Обычно занимает 15–30 секунд</p>
           </div>
-          <div className="flex gap-2">
-            {[0, 1, 2].map(i => (
-              <div key={i} className="w-2 h-2 rounded-full bg-purple-500 animate-pulse"
-                style={{ animationDelay: `${i * 0.25}s` }} />
+
+          <div style={{ width: '100%', maxWidth: 280 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
+              <span style={{ fontSize: 12, color: 'rgba(255,255,255,0.4)' }}>Прогресс</span>
+              <span style={{ fontSize: 12, color: '#a855f7' }}>{Math.round(progress)}%</span>
+            </div>
+            <div style={{ height: 6, borderRadius: 3, background: 'rgba(255,255,255,0.08)', overflow: 'hidden' }}>
+              <div style={{
+                height: '100%', borderRadius: 3, transition: 'width 0.8s ease',
+                width: `${progress}%`,
+                background: 'linear-gradient(90deg, #a855f7, #06b6d4)',
+              }} />
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', gap: 16 }}>
+            {[personPreview, garmentPreview].map((src, i) => (
+              <div key={i} style={{ width: 80, height: 80, borderRadius: 12, overflow: 'hidden', border: '1px solid rgba(255,255,255,0.1)' }}>
+                {src && <img src={src} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />}
+              </div>
             ))}
           </div>
         </div>
       )}
 
-      {/* ШАГ 3: Примерка */}
-      {step === 'tryon' && (
-        <>
-          <div className="mx-5 relative rounded-3xl overflow-hidden flex-shrink-0" style={{ height: '320px' }}>
-            {/* Видео */}
-            <video ref={videoRef} playsInline muted
-              className="absolute inset-0 w-full h-full object-cover"
-              style={{ transform: facingMode === 'user' ? 'scaleX(-1)' : 'none', display: cameraStatus === 'active' ? 'block' : 'none' }}
-            />
-            {/* Overlay canvas — НЕ зеркалим через CSS, X-координаты считаем вручную */}
-            <canvas ref={overlayCanvasRef}
-              className="absolute inset-0 w-full h-full"
-              style={{ display: cameraStatus === 'active' ? 'block' : 'none', pointerEvents: 'none' }}
-            />
-
-            {/* Фон */}
-            {cameraStatus !== 'active' && (
-              <div className="absolute inset-0" style={{ background: 'linear-gradient(160deg, #0f1729 0%, #1a0f2e 50%, #0d1a2e 100%)' }}>
-                <div className="absolute inset-0 opacity-10"
-                  style={{ backgroundImage: 'linear-gradient(rgba(6,182,212,0.5) 1px, transparent 1px), linear-gradient(90deg, rgba(6,182,212,0.5) 1px, transparent 1px)', backgroundSize: '30px 30px' }} />
-              </div>
-            )}
-
-            {/* AR уголки */}
-            <div className="ar-corner ar-corner-tl animate-ar-pulse" />
-            <div className="ar-corner ar-corner-tr animate-ar-pulse" />
-            <div className="ar-corner ar-corner-bl animate-ar-pulse" />
-            <div className="ar-corner ar-corner-br animate-ar-pulse" />
-
-            {scanning && (
-              <div className="absolute left-0 right-0 h-0.5 animate-ar-scan z-10"
-                style={{ background: 'linear-gradient(90deg, transparent, #06b6d4, transparent)' }} />
-            )}
-
-            {/* Pose статус */}
-            {cameraStatus === 'active' && (
-              <div className="absolute bottom-3 left-3 z-20 glass rounded-xl px-2.5 py-1.5 flex items-center gap-1.5">
-                <div className={`w-2 h-2 rounded-full ${poseFoundUI ? 'bg-green-400' : 'bg-yellow-400 animate-pulse'}`} />
-                <span className="text-xs font-600" style={{ color: poseFoundUI ? '#4ade80' : '#facc15' }}>
-                  {poseFoundUI ? t.poseFound : t.poseSearch}
-                </span>
-              </div>
-            )}
-
-            {/* Flip */}
-            {cameraStatus === 'active' && (
-              <button onClick={handleFlip} className="absolute top-3 right-3 glass rounded-xl p-2 z-20 active:scale-90 transition-transform">
-                <Icon name="RefreshCw" size={15} className="text-white/70" />
-              </button>
-            )}
-
-            {/* Превью + старт */}
-            {clothImage && cameraStatus !== 'active' && cameraStatus !== 'requesting' && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 z-10">
-                <img src={clothImage} alt="" className="w-28 object-contain animate-float"
-                  style={{ filter: 'drop-shadow(0 0 20px rgba(168,85,247,0.7))' }} />
-                <button onClick={() => startCamera(facingMode)}
-                  className="btn-primary px-5 py-3 font-montserrat font-700 text-sm flex items-center gap-2 rounded-xl">
-                  <Icon name="Camera" size={16} className="text-white" />
-                  {t.startCamera}
-                </button>
-              </div>
-            )}
-
-            {cameraStatus === 'requesting' && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 z-10">
-                <div className="w-10 h-10 rounded-full border-2 border-purple-500/30 border-t-purple-500 animate-spin" />
-                <p className="text-white/50 text-sm">{lang === 'ru' ? 'Запрашиваю камеру...' : 'Starting camera...'}</p>
-              </div>
-            )}
-
-            {cameraStatus === 'denied' && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-8 text-center z-10">
-                <Icon name="CameraOff" size={28} className="text-red-400" />
-                <p className="text-white/70 text-sm font-600">{t.denied}</p>
-                <p className="text-white/30 text-xs">{t.deniedHint}</p>
-                <button onClick={() => startCamera(facingMode)} className="btn-secondary px-4 py-2 text-sm rounded-xl">{t.retry}</button>
-              </div>
-            )}
-
-            {cameraStatus === 'error' && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-8 text-center z-10">
-                <Icon name="AlertTriangle" size={28} className="text-orange-400" />
-                <p className="text-white/70 text-sm font-600">{t.error}</p>
-                <p className="text-white/30 text-xs">{t.errorHint}</p>
-                <button onClick={() => startCamera(facingMode)} className="btn-secondary px-4 py-2 text-sm rounded-xl">{t.retry}</button>
-              </div>
-            )}
-
-            {photoStatus === 'flash' && <div className="absolute inset-0 z-50 pointer-events-none bg-white/90" />}
-
-            <div className="absolute bottom-0 left-0 right-0 h-10 pointer-events-none z-10"
-              style={{ background: 'linear-gradient(to top, rgba(8,11,20,0.5), transparent)' }} />
+      {/* ШАГ 4: Результат с 3D эффектом */}
+      {step === 'result' && resultUrl && (
+        <div style={{ flex: 1, padding: '12px 20px 0', display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <div style={{ textAlign: 'center' }}>
+            <p style={{ margin: 0, fontSize: 13, color: 'rgba(255,255,255,0.4)' }}>
+              Перетащи пальцем для 3D просмотра
+            </p>
           </div>
 
-          {/* Тип одежды — показываем что определили, можно скорректировать */}
-          {step === 'tryon' && (
-            <div className="mx-5 mt-3 flex-shrink-0">
-              <div className="glass rounded-2xl p-2.5 flex items-center gap-2 flex-wrap">
-                <span className="text-xs text-white/30 mr-1">
-                  {lang === 'ru' ? 'Тип:' : 'Type:'}
-                </span>
-                {(['top', 'dress', 'bottom', 'shoes', 'hat'] as ClothType[]).map(type => {
-                  const labels: Record<ClothType, string> = {
-                    top: lang === 'ru' ? '🧥 Верх' : '🧥 Top',
-                    dress: lang === 'ru' ? '👗 Платье' : '👗 Dress',
-                    bottom: lang === 'ru' ? '👖 Низ' : '👖 Bottom',
-                    shoes: lang === 'ru' ? '👟 Обувь' : '👟 Shoes',
-                    hat: lang === 'ru' ? '🧢 Шапка' : '🧢 Hat',
-                    accessory: lang === 'ru' ? '💍 Аксессуар' : '💍 Accessory',
-                  };
-                  const isActive = clothType === type;
-                  return (
-                    <button key={type} onClick={() => {
-                      setClothType(type);
-                      clothTypeRef.current = type;
-                      poseResultRef.current = null;
-                      smooth.current.ready = false;
-                    }}
-                      className="text-xs px-2.5 py-1 rounded-xl font-montserrat font-600 transition-all duration-200"
-                      style={isActive ? {
-                        background: 'linear-gradient(135deg, rgba(168,85,247,0.4), rgba(6,182,212,0.3))',
-                        border: '1px solid rgba(168,85,247,0.6)',
-                        color: '#c084fc',
-                      } : {
-                        background: 'rgba(255,255,255,0.05)',
-                        border: '1px solid rgba(255,255,255,0.08)',
-                        color: 'rgba(255,255,255,0.35)',
-                      }}>
-                      {labels[type]}
-                    </button>
-                  );
-                })}
-              </div>
+          {/* 3D просмотр */}
+          <div
+            style={{ flex: 1, minHeight: 340, position: 'relative', perspective: '800px', cursor: isDragging3d ? 'grabbing' : 'grab' }}
+            onMouseDown={onMouse3dDown}
+            onMouseMove={onMouse3dMove}
+            onMouseUp={onMouse3dUp}
+            onMouseLeave={onMouse3dUp}
+            onTouchStart={onTouch3dStart}
+            onTouchMove={onTouch3dMove}
+          >
+            <div style={{
+              width: '100%', height: '100%', borderRadius: 20, overflow: 'hidden',
+              transform: `rotateX(${rotate3d.x}deg) rotateY(${rotate3d.y}deg)`,
+              transition: isDragging3d ? 'none' : 'transform 0.5s ease',
+              boxShadow: '0 20px 60px rgba(0,0,0,0.5), 0 0 0 1px rgba(168,85,247,0.2)',
+              transformStyle: 'preserve-3d',
+            }}>
+              <img
+                src={resultUrl}
+                alt="result"
+                draggable={false}
+                style={{ width: '100%', height: '100%', objectFit: 'cover', borderRadius: 20, display: 'block', userSelect: 'none' }}
+              />
+              <div style={{
+                position: 'absolute', inset: 0, borderRadius: 20,
+                background: 'linear-gradient(135deg, rgba(168,85,247,0.05), transparent, rgba(6,182,212,0.05))',
+                pointerEvents: 'none',
+              }} />
             </div>
-          )}
 
-          {/* Ручные регуляторы */}
-          {cameraStatus === 'active' && (
-            <div className="mx-5 mt-2 glass rounded-2xl p-3 space-y-2 flex-shrink-0">
-              <p className="text-xs text-white/30 text-center">
-                {poseFoundUI ? (lang === 'ru' ? 'Нейросеть управляет · коррекция вручную' : 'AI tracking · manual correction') : t.manualMode}
-              </p>
-              <div className="flex items-center gap-3">
-                <Icon name="Maximize2" size={14} className="text-purple-400 flex-shrink-0" />
-                <div className="flex-1">
-                  <div className="flex justify-between text-xs text-white/40 mb-1">
-                    <span>{t.size}</span>
-                    <span className="text-purple-400 font-600">{sizeLabel}</span>
-                  </div>
-                  <input type="range" min="10" max="100" value={manualSize}
-                    onChange={e => { setManualSize(Number(e.target.value)); poseResultRef.current = null; smooth.current.ready = false; }}
-                    className="w-full cursor-pointer" />
-                </div>
+            {/* Подсказка вращения */}
+            {rotate3d.x === 0 && rotate3d.y === 0 && (
+              <div style={{
+                position: 'absolute', bottom: 16, left: '50%', transform: 'translateX(-50%)',
+                background: 'rgba(0,0,0,0.6)', borderRadius: 20, padding: '6px 14px',
+                fontSize: 11, color: 'rgba(255,255,255,0.7)', display: 'flex', alignItems: 'center', gap: 6,
+                backdropFilter: 'blur(8px)', pointerEvents: 'none',
+              }}>
+                <Icon name="Move" size={12} style={{ color: '#a855f7' }} />
+                Потяни для 3D вращения
               </div>
-              <div className="flex items-center gap-3">
-                <Icon name="MoveVertical" size={14} className="text-cyan-400 flex-shrink-0" />
-                <div className="flex-1">
-                  <div className="flex justify-between text-xs text-white/40 mb-1">
-                    <span>{t.position}</span>
-                    <span className="text-cyan-400 font-600">
-                      {manualPosY < 25 ? (lang === 'ru' ? 'Выше' : 'Up') : manualPosY > 55 ? (lang === 'ru' ? 'Ниже' : 'Down') : (lang === 'ru' ? 'Центр' : 'Center')}
-                    </span>
-                  </div>
-                  <input type="range" min="5" max="80" value={manualPosY}
-                    onChange={e => { setManualPosY(Number(e.target.value)); poseResultRef.current = null; smooth.current.ready = false; }}
-                    className="w-full cursor-pointer" />
-                </div>
-              </div>
-            </div>
-          )}
+            )}
+          </div>
 
           {/* Кнопки */}
-          {cameraStatus === 'active' && (
-            <div className="px-5 mt-3 flex gap-3 flex-shrink-0">
-              <button onClick={handlePhoto}
-                className="flex-shrink-0 w-14 h-12 rounded-2xl flex items-center justify-center transition-all duration-200 active:scale-90"
-                style={{
-                  background: photoStatus === 'done' ? 'rgba(34,197,94,0.2)' : 'linear-gradient(135deg, #06b6d4, #6366f1)',
-                  boxShadow: photoStatus !== 'done' ? '0 0 20px rgba(6,182,212,0.5)' : '0 0 20px rgba(34,197,94,0.4)',
-                  border: '2px solid rgba(255,255,255,0.15)',
-                }}>
-                <Icon name={photoStatus === 'done' ? 'Check' : 'Camera'} size={20} className="text-white" />
-              </button>
-              <button onClick={handleSave}
-                className={`flex-1 py-3 rounded-2xl font-montserrat font-700 text-sm flex items-center justify-center gap-2 transition-all duration-300 ${saved ? 'border text-green-400' : 'btn-primary'}`}
-                style={saved ? { background: 'rgba(34,197,94,0.15)', borderColor: 'rgba(34,197,94,0.4)' } : {}}>
-                <Icon name={saved ? 'Check' : 'Heart'} size={16} />
-                {saved ? t.saved : t.save}
-              </button>
-              <button className="btn-secondary w-12 h-12 rounded-2xl flex items-center justify-center flex-shrink-0">
-                <Icon name="Share2" size={17} className="text-white/70" />
-              </button>
+          <div style={{ display: 'flex', gap: 10 }}>
+            <button
+              onClick={handleSave}
+              style={{
+                flex: 1, padding: '14px', borderRadius: 16, border: 'none', cursor: 'pointer', fontWeight: 700, fontSize: 14,
+                background: saved ? 'rgba(34,197,94,0.2)' : 'rgba(168,85,247,0.15)',
+                color: saved ? '#4ade80' : '#c084fc',
+                border: `1px solid ${saved ? 'rgba(34,197,94,0.3)' : 'rgba(168,85,247,0.3)'}`,
+                transition: 'all 0.3s',
+              }}
+            >
+              {saved ? '✓ Сохранено' : '↓ Сохранить'}
+            </button>
+            <button
+              onClick={reset}
+              style={{
+                flex: 1, padding: '14px', borderRadius: 16, border: 'none', cursor: 'pointer', fontWeight: 700, fontSize: 14,
+                background: 'linear-gradient(135deg, #a855f7, #06b6d4)', color: '#fff',
+                boxShadow: '0 4px 20px rgba(168,85,247,0.4)',
+              }}
+            >
+              Примерить ещё →
+            </button>
+          </div>
+
+          {/* Мини-превью исходников */}
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', justifyContent: 'center' }}>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ width: 48, height: 56, borderRadius: 8, overflow: 'hidden', border: '1px solid rgba(255,255,255,0.1)' }}>
+                {personPreview && <img src={personPreview} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />}
+              </div>
+              <p style={{ margin: '3px 0 0', fontSize: 10, color: 'rgba(255,255,255,0.3)' }}>Ты</p>
             </div>
-          )}
-
-          {photoStatus === 'done' && (
-            <p className="text-center text-xs text-cyan-400 mt-2 flex-shrink-0 animate-fade-in-up">{t.photoSaved}</p>
-          )}
-
-          <div className="mx-5 mt-3 mb-1 flex-shrink-0">
-            <div className="glass rounded-xl px-4 py-2.5">
-              <p className="text-xs text-white/35 text-center">{t.tips[tipIndex]}</p>
+            <Icon name="Plus" size={14} style={{ color: 'rgba(255,255,255,0.2)', marginBottom: 12 }} />
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ width: 48, height: 56, borderRadius: 8, overflow: 'hidden', border: '1px solid rgba(255,255,255,0.1)' }}>
+                {garmentPreview && <img src={garmentPreview} style={{ width: '100%', height: '100%', objectFit: 'contain', background: 'rgba(255,255,255,0.05)' }} />}
+              </div>
+              <p style={{ margin: '3px 0 0', fontSize: 10, color: 'rgba(255,255,255,0.3)' }}>Одежда</p>
+            </div>
+            <Icon name="Equals" size={14} style={{ color: 'rgba(255,255,255,0.2)', marginBottom: 12 }} />
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ width: 48, height: 56, borderRadius: 8, overflow: 'hidden', border: '1px solid rgba(168,85,247,0.3)' }}>
+                <img src={resultUrl} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+              </div>
+              <p style={{ margin: '3px 0 0', fontSize: 10, color: '#a855f7' }}>Результат</p>
             </div>
           </div>
-        </>
+        </div>
       )}
+
+      <style>{`
+        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+      `}</style>
     </div>
   );
 }

@@ -1,0 +1,18 @@
+{
+  "tests": [
+    {
+      "name": "OPTIONS preflight",
+      "method": "OPTIONS",
+      "path": "/",
+      "expectedStatus": 200
+    },
+    {
+      "name": "Run without images - no key",
+      "method": "POST",
+      "path": "/",
+      "body": {"action": "run"},
+      "expectedStatus": 500,
+      "bodyMatcher": "partial"
+    }
+  ]
+}
