@@ -41,7 +41,7 @@ def get_pure_base64(data_url: str) -> str:
     return data_url
 
 
-def describe_and_generate(model_b64: str, garment_b64: str, category: str, api_key: str) -> str:
+def describe_and_generate(model_b64: str, garment_b64: str, category: str, api_key: str, folder_id: str) -> str:
     """
     Шаг 1: Gemma 3 27B смотрит на фото человека и одежды,
             составляет точный промпт для генерации.
@@ -55,7 +55,7 @@ def describe_and_generate(model_b64: str, garment_b64: str, category: str, api_k
 
     # ── Шаг 1: анализ двух фото через Gemma 3 27B ─────────────────────────
     text_payload = {
-        'model': 'gpt://b1gtcbrqbbp2v3nf30eu/gemma-3-27b-it',
+        'model': f'gpt://{folder_id}/gemma-3-27b-it',
         'messages': [
             {
                 'role': 'user',
@@ -105,7 +105,7 @@ def describe_and_generate(model_b64: str, garment_b64: str, category: str, api_k
 
     # ── Шаг 2: генерация через YandexART ──────────────────────────────────
     image_payload = {
-        'modelUri': 'art://b1gtcbrqbbp2v3nf30eu/yandex-art/latest',
+        'modelUri': f'art://{folder_id}/yandex-art/latest',
         'generationOptions': {
             'seed': str(int(time.time()) % 10000),
             'aspectRatio': {'widthRatio': '3', 'heightRatio': '4'},
@@ -174,6 +174,11 @@ def handler(event: dict, context) -> dict:
         return {'statusCode': 500, 'headers': CORS,
                 'body': json.dumps({'error': 'YANDEX_API_KEY не настроен'})}
 
+    folder_id = os.environ.get('YANDEX_FOLDER_ID', '')
+    if not folder_id:
+        return {'statusCode': 500, 'headers': CORS,
+                'body': json.dumps({'error': 'YANDEX_FOLDER_ID не настроен'})}
+
     body = json.loads(event.get('body') or '{}')
     action = body.get('action', 'run')
 
@@ -186,7 +191,7 @@ def handler(event: dict, context) -> dict:
             return {'statusCode': 400, 'headers': CORS,
                     'body': json.dumps({'error': 'Нужны model_image и garment_image'})}
 
-        result_url = describe_and_generate(model_b64, garment_b64, category, api_key)
+        result_url = describe_and_generate(model_b64, garment_b64, category, api_key, folder_id)
 
         return {
             'statusCode': 200,

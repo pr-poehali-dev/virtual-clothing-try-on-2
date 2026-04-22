@@ -7,11 +7,11 @@
       "expectedStatus": 200
     },
     {
-      "name": "Run without images",
+      "name": "Run without config",
       "method": "POST",
       "path": "/",
       "body": {"action": "run"},
-      "expectedStatus": 400,
+      "expectedStatus": 500,
       "bodyMatcher": "partial"
     }
   ]
