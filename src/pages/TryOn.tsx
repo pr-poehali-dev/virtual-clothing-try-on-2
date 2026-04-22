@@ -8,33 +8,6 @@ type AppStep = 'upload' | 'processing' | 'tryon';
 type PhotoStatus = 'idle' | 'flash' | 'done';
 type Lang = 'ru' | 'en';
 
-// MediaPipe Pose landmarks индексы
-const POSE = {
-  LEFT_SHOULDER: 11,
-  RIGHT_SHOULDER: 12,
-  LEFT_HIP: 23,
-  RIGHT_HIP: 24,
-  LEFT_ELBOW: 13,
-  RIGHT_ELBOW: 14,
-};
-
-interface Landmark { x: number; y: number; z: number; visibility?: number; }
-
-declare global {
-  interface Window {
-    Pose: new (config: object) => {
-      setOptions: (opts: object) => void;
-      onResults: (cb: (results: PoseResults) => void) => void;
-      send: (data: { image: HTMLVideoElement }) => Promise<void>;
-      close: () => void;
-    };
-  }
-}
-
-interface PoseResults {
-  poseLandmarks?: Landmark[];
-}
-
 const T = {
   ru: {
     subtitle: 'Примеряй одежду не выходя из дома',
@@ -43,7 +16,6 @@ const T = {
     processing: 'Нейросеть вырезает одежду...',
     processingHint: 'remove.bg убирает фон с фотографии',
     startCamera: 'Включить камеру',
-    active: '● Нейросеть активна',
     denied: 'Доступ к камере запрещён',
     deniedHint: 'Разреши доступ в настройках браузера',
     error: 'Камера недоступна',
@@ -53,17 +25,20 @@ const T = {
     saved: 'Сохранено!',
     photoSaved: '✓ Фото сохранено',
     changeCloth: 'Сменить',
-    detectingPose: 'Ищу тело...',
-    poseFound: 'Тело найдено!',
+    poseFound: '● Тело найдено',
+    poseSearch: '○ Поиск тела...',
+    manualMode: 'Ручная настройка',
+    size: 'Размер',
+    position: 'Положение',
+    errBg: 'Не удалось обработать фото. Попробуй другое изображение.',
+    aiHint: 'ИИ уберёт фон → нейросеть наденет одежду на тебя',
     tips: [
       '💡 Встань прямо, лицом к камере',
-      '💡 Отойди на 1–2 метра, чтобы было видно всё тело',
+      '💡 Отойди на 1–2 метра — тело должно быть видно целиком',
       '💡 Хорошее освещение улучшает точность',
       '💡 Держи телефон на уровне груди',
-      '💡 Не двигайся резко — нейросеть обновляется каждый кадр',
+      '💡 Двигайся плавно — нейросеть обновляется каждый кадр',
     ],
-    errBg: 'Не удалось обработать фото. Попробуй другое изображение.',
-    noAI: 'Загрузка нейросети...',
   },
   en: {
     subtitle: 'Try on clothes without leaving home',
@@ -72,7 +47,6 @@ const T = {
     processing: 'AI removing background...',
     processingHint: 'remove.bg cuts out the clothing',
     startCamera: 'Start camera',
-    active: '● AI active',
     denied: 'Camera access denied',
     deniedHint: 'Allow access in browser settings',
     error: 'Camera unavailable',
@@ -82,23 +56,25 @@ const T = {
     saved: 'Saved!',
     photoSaved: '✓ Photo saved',
     changeCloth: 'Change',
-    detectingPose: 'Detecting body...',
-    poseFound: 'Body detected!',
+    poseFound: '● Body found',
+    poseSearch: '○ Searching...',
+    manualMode: 'Manual adjustment',
+    size: 'Size',
+    position: 'Position',
+    errBg: 'Could not process photo. Try a different image.',
+    aiHint: 'AI removes background → neural net fits clothing on you',
     tips: [
       '💡 Stand straight, facing the camera',
-      '💡 Step back 1–2 meters so your full body is visible',
+      '💡 Step back 1–2 m so your full body is visible',
       '💡 Good lighting improves accuracy',
       '💡 Hold phone at chest level',
       '💡 Move smoothly — AI updates every frame',
     ],
-    errBg: 'Could not process photo. Try a different image.',
-    noAI: 'Loading AI model...',
   },
 };
 
 interface TryOnProps { lang?: Lang; }
 
-// Интерполяция координат для плавности
 function lerp(a: number, b: number, t: number) { return a + (b - a) * t; }
 
 export default function TryOn({ lang = 'ru' }: TryOnProps) {
@@ -109,29 +85,33 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
   const [bgError, setBgError] = useState('');
   const [saved, setSaved] = useState(false);
   const [cameraStatus, setCameraStatus] = useState<CameraStatus>('idle');
-  const [scanning, setScanning] = useState(false);
-  const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user');
   const [photoStatus, setPhotoStatus] = useState<PhotoStatus>('idle');
   const [tipIndex, setTipIndex] = useState(0);
-  const [poseStatus, setPoseStatus] = useState<'none' | 'detecting' | 'found'>('none');
-  const [poseModelReady, setPoseModelReady] = useState(false);
-
-  // Мануальные регуляторы (если поза не найдена)
+  const [scanning, setScanning] = useState(false);
+  const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user');
   const [manualSize, setManualSize] = useState(55);
-  const [manualPosY, setManualPosY] = useState(35);
-  const [showManual, setShowManual] = useState(false);
+  const [manualPosY, setManualPosY] = useState(30);
+  const [poseFoundUI, setPoseFoundUI] = useState(false);
 
+  // Refs — не вызывают ре-рендер, безопасны в RAF
+  const poseActiveRef = useRef(false);
+  const poseResultRef = useRef<{ x: number; y: number; w: number; h: number } | null>(null);
+  const smooth = useRef({ cx: 0.5, cy: 0.15, cw: 0.55, ch: 0.6, ready: false });
   const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
   const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
+  const captureCanvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const poseRef = useRef<ReturnType<typeof window.Pose> | null>(null);
   const rafRef = useRef<number>(0);
-  const clothImgElRef = useRef<HTMLImageElement | null>(null);
+  const clothImgRef = useRef<HTMLImageElement | null>(null);
+  const facingModeRef = useRef(facingMode);
+  const manualSizeRef = useRef(manualSize);
+  const manualPosYRef = useRef(manualPosY);
 
-  // Плавные текущие координаты наложения (интерполируются для живости)
-  const smoothRef = useRef({ x: 0.5, y: 0.25, w: 0.5, h: 0.5, active: false });
+  // Синхронизируем refs со state
+  useEffect(() => { facingModeRef.current = facingMode; }, [facingMode]);
+  useEffect(() => { manualSizeRef.current = manualSize; }, [manualSize]);
+  useEffect(() => { manualPosYRef.current = manualPosY; }, [manualPosY]);
 
   // Подсказки
   useEffect(() => {
@@ -139,93 +119,16 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
     return () => clearInterval(id);
   }, [t.tips.length]);
 
-  // Инициализация MediaPipe Pose
-  const initPose = useCallback(() => {
-    if (!window.Pose || poseRef.current) return;
-    try {
-      const pose = new window.Pose({
-        locateFile: (file: string) =>
-          `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`,
-      });
-      pose.setOptions({
-        modelComplexity: 1,
-        smoothLandmarks: true,
-        enableSegmentation: false,
-        smoothSegmentation: false,
-        minDetectionConfidence: 0.55,
-        minTrackingConfidence: 0.55,
-      });
-      pose.onResults((results: PoseResults) => {
-        const lm = results.poseLandmarks;
-        if (!lm || lm.length < 25) {
-          setPoseStatus('detecting');
-          smoothRef.current.active = false;
-          return;
-        }
-
-        const ls = lm[POSE.LEFT_SHOULDER];
-        const rs = lm[POSE.RIGHT_SHOULDER];
-        const lh = lm[POSE.LEFT_HIP];
-        const rh = lm[POSE.RIGHT_HIP];
-
-        // Видимость плечей
-        const shoulderVis = Math.min(ls.visibility ?? 0, rs.visibility ?? 0);
-        if (shoulderVis < 0.3) {
-          setPoseStatus('detecting');
-          smoothRef.current.active = false;
-          return;
-        }
-
-        setPoseStatus('found');
-
-        // Центр и размер одежды по скелету
-        const centerX = (ls.x + rs.x) / 2;
-        const topY = Math.min(ls.y, rs.y) - 0.04; // чуть выше плеч
-        const shoulderW = Math.abs(ls.x - rs.x);
-
-        // Высота = от плеч до бёдер (если видны)
-        const hipVis = Math.min(lh.visibility ?? 0, rh.visibility ?? 0);
-        const bodyH = hipVis > 0.3
-          ? Math.abs(((lh.y + rh.y) / 2) - topY) + 0.06
-          : shoulderW * 1.4;
-
-        // Ширина одежды = ширина плеч × коэффициент (одежда шире тела)
-        const clothW = shoulderW * 1.55;
-
-        // Плавная интерполяция
-        const s = smoothRef.current;
-        const speed = s.active ? 0.18 : 0.6; // быстро при первом появлении
-        s.x = lerp(s.x, centerX - clothW / 2, speed);
-        s.y = lerp(s.y, topY, speed);
-        s.w = lerp(s.w, clothW, speed);
-        s.h = lerp(s.h, bodyH, speed);
-        s.active = true;
-      });
-      poseRef.current = pose;
-      setPoseModelReady(true);
-    } catch { /* MediaPipe ещё не загружен */ }
-  }, []);
-
-  // Ждём загрузки MediaPipe
-  useEffect(() => {
-    const check = () => {
-      if (window.Pose) { initPose(); }
-      else { setTimeout(check, 300); }
-    };
-    check();
-    return () => { poseRef.current?.close(); poseRef.current = null; };
-  }, [initPose]);
-
   // Камера
   const stopCamera = useCallback(() => {
     cancelAnimationFrame(rafRef.current);
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(tr => tr.stop());
-      streamRef.current = null;
-    }
+    streamRef.current?.getTracks().forEach(tr => tr.stop());
+    streamRef.current = null;
     if (videoRef.current) videoRef.current.srcObject = null;
-    smoothRef.current.active = false;
-    setPoseStatus('none');
+    poseActiveRef.current = false;
+    poseResultRef.current = null;
+    smooth.current.ready = false;
+    setPoseFoundUI(false);
   }, []);
 
   const startCamera = useCallback(async (facing: 'user' | 'environment') => {
@@ -238,12 +141,9 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
         audio: false,
       });
       streamRef.current = stream;
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play();
-      }
+      const video = videoRef.current;
+      if (video) { video.srcObject = stream; await video.play(); }
       setCameraStatus('active');
-      setPoseStatus('detecting');
       setTimeout(() => setScanning(false), 1200);
     } catch (err: unknown) {
       stopCamera();
@@ -255,84 +155,149 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
 
   useEffect(() => () => stopCamera(), [stopCamera]);
 
-  // Главный цикл рендера — pose + наложение на canvas
+  // MediaPipe Pose — запускаем когда камера активна
   useEffect(() => {
-    if (cameraStatus !== 'active' || !clothImgElRef.current) return;
+    if (cameraStatus !== 'active') return;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const W = window as any;
+    if (!W.Pose) return; // MediaPipe ещё не загружен — ничего страшного, работает ручной режим
+
+    let pose: { send: (d: { image: HTMLVideoElement }) => Promise<void>; close: () => void } | null = null;
+    let destroyed = false;
+
+    try {
+      pose = new W.Pose({
+        locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`,
+      });
+
+      pose!.setOptions({
+        modelComplexity: 1,
+        smoothLandmarks: true,
+        enableSegmentation: false,
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5,
+      });
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (pose as any).onResults((results: any) => {
+        if (destroyed) return;
+        const lm = results.poseLandmarks;
+        if (!lm || lm.length < 25) {
+          poseActiveRef.current = false;
+          poseResultRef.current = null;
+          setPoseFoundUI(false);
+          return;
+        }
+        const ls = lm[11]; const rs = lm[12];
+        const lh = lm[23]; const rh = lm[24];
+        if ((ls.visibility ?? 0) < 0.3 || (rs.visibility ?? 0) < 0.3) {
+          poseActiveRef.current = false;
+          poseResultRef.current = null;
+          setPoseFoundUI(false);
+          return;
+        }
+        const shoulderW = Math.abs(ls.x - rs.x);
+        const topY = Math.min(ls.y, rs.y) - 0.05;
+        const clothW = shoulderW * 1.6;
+        const centerX = (ls.x + rs.x) / 2 - clothW / 2;
+        const hVis = Math.min(lh.visibility ?? 0, rh.visibility ?? 0);
+        const bodyH = hVis > 0.25
+          ? Math.abs(((lh.y + rh.y) / 2) - topY) + 0.08
+          : shoulderW * 1.5;
+
+        poseResultRef.current = { x: centerX, y: topY, w: clothW, h: bodyH };
+        poseActiveRef.current = true;
+        setPoseFoundUI(true);
+      });
+    } catch {
+      return; // MediaPipe недоступен — работаем в ручном режиме
+    }
+
+    const video = videoRef.current;
+    const poseInterval = setInterval(async () => {
+      if (destroyed || !video || video.readyState < 2 || !streamRef.current) return;
+      try { await pose!.send({ image: video }); } catch { /* ignore */ }
+    }, 120);
+
+    return () => {
+      destroyed = true;
+      clearInterval(poseInterval);
+      try { pose?.close(); } catch { /* ignore */ }
+    };
+  }, [cameraStatus]);
+
+  // RAF цикл — рисует одежду на overlay canvas
+  useEffect(() => {
+    if (cameraStatus !== 'active') return;
 
     const video = videoRef.current;
     const canvas = overlayCanvasRef.current;
     if (!video || !canvas) return;
 
-    let frameCount = 0;
-    const POSE_EVERY = 3; // отправляем в pose каждые 3 кадра
-
-    const render = async () => {
+    const render = () => {
       rafRef.current = requestAnimationFrame(render);
-
       if (video.readyState < 2) return;
       const vw = video.videoWidth;
       const vh = video.videoHeight;
       if (!vw || !vh) return;
+      if (canvas.width !== vw) canvas.width = vw;
+      if (canvas.height !== vh) canvas.height = vh;
 
-      canvas.width = vw;
-      canvas.height = vh;
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
-
       ctx.clearRect(0, 0, vw, vh);
 
-      // Отправляем кадр в MediaPipe Pose
-      if (poseRef.current && frameCount % POSE_EVERY === 0) {
-        try { await poseRef.current.send({ image: video }); } catch { /* ignore */ }
-      }
-      frameCount++;
+      const clothEl = clothImgRef.current;
+      if (!clothEl?.complete || !clothEl.naturalWidth) return;
 
-      const clothEl = clothImgElRef.current;
-      if (!clothEl || !clothEl.complete) return;
+      let tx: number, ty: number, tw: number;
 
-      const s = smoothRef.current;
-      let cx: number, cy: number, cw: number, ch: number;
+      const pr = poseResultRef.current;
+      if (pr && poseActiveRef.current) {
+        const s = smooth.current;
+        const speed = s.ready ? 0.14 : 0.7;
+        s.cx = lerp(s.cx, pr.x, speed);
+        s.cy = lerp(s.cy, pr.y, speed);
+        s.cw = lerp(s.cw, pr.w, speed);
+        s.ch = lerp(s.ch, pr.h, speed);
+        s.ready = true;
 
-      if (s.active && poseStatus !== 'none') {
-        // Позиция из нейросети (координаты 0–1 → пиксели)
-        cw = s.w * vw;
-        ch = s.h * vh;
-        cx = s.x * vw;
-        cy = s.y * vh;
+        // canvas зеркалится через CSS transform — поэтому X не инвертируем
+        tw = s.cw * vw;
+        tx = s.cx * vw;
+        ty = s.cy * vh;
       } else {
-        // Ручное управление
-        cw = vw * (0.35 + manualSize * 0.005);
-        ch = cw * (clothEl.naturalHeight / clothEl.naturalWidth);
-        cx = (vw - cw) / 2;
-        cy = vh * (manualPosY / 100);
+        tw = vw * (0.3 + manualSizeRef.current * 0.005);
+        tx = (vw - tw) / 2;
+        ty = vh * (manualPosYRef.current / 100);
       }
 
-      // Сохраняем пропорции одежды
-      const aspectRatio = clothEl.naturalWidth / clothEl.naturalHeight;
-      const targetH = cw / aspectRatio;
+      const aspect = clothEl.naturalWidth / clothEl.naturalHeight;
+      const drawH = tw / aspect;
+      const sway = Math.sin(Date.now() / 1800) * 0.013;
 
-      // Тень под одеждой
+      // Мягкая тень под одеждой
       ctx.save();
-      ctx.globalAlpha = 0.3;
-      ctx.filter = 'blur(8px)';
-      ctx.drawImage(clothEl, cx + cw * 0.1, cy + targetH * 0.85, cw * 0.8, targetH * 0.12);
+      ctx.globalAlpha = 0.2;
+      ctx.filter = 'blur(10px)';
+      ctx.drawImage(clothEl, tx + tw * 0.1, ty + drawH * 0.92, tw * 0.8, drawH * 0.1);
       ctx.restore();
 
-      // Одежда с лёгким покачиванием
-      const swayAngle = Math.sin(Date.now() / 1800) * 0.018;
+      // Одежда с покачиванием
       ctx.save();
-      ctx.translate(cx + cw / 2, cy);
-      ctx.rotate(swayAngle);
-      ctx.shadowColor = 'rgba(0,0,0,0.6)';
-      ctx.shadowBlur = 20;
-      ctx.shadowOffsetY = 8;
-      ctx.drawImage(clothEl, -cw / 2, 0, cw, targetH);
+      ctx.translate(tx + tw / 2, ty);
+      ctx.rotate(sway);
+      ctx.shadowColor = 'rgba(0,0,0,0.55)';
+      ctx.shadowBlur = 16;
+      ctx.shadowOffsetY = 5;
+      ctx.drawImage(clothEl, -tw / 2, 0, tw, drawH);
       ctx.restore();
     };
 
     render();
     return () => cancelAnimationFrame(rafRef.current);
-  }, [cameraStatus, poseStatus, manualSize, manualPosY]);
+  }, [cameraStatus]); // только cameraStatus — всё остальное через refs
 
   // Загрузка фото
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -340,7 +305,6 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
     if (!file) return;
     setBgError('');
     setStep('processing');
-
     const reader = new FileReader();
     reader.onload = async (ev) => {
       const b64 = ev.target?.result as string;
@@ -352,14 +316,13 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
         });
         const data = await res.json();
         if (data.ok && data.image) {
-          setClothImage(data.image);
           const img = new Image();
+          img.onload = () => { clothImgRef.current = img; };
           img.src = data.image;
-          img.onload = () => { clothImgElRef.current = img; };
-          clothImgElRef.current = img;
+          setClothImage(data.image);
           setStep('tryon');
           setCameraStatus('idle');
-          smoothRef.current.active = false;
+          smooth.current.ready = false;
         } else {
           setBgError(t.errBg);
           setStep('upload');
@@ -376,6 +339,8 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
   const handleFlip = () => {
     const next = facingMode === 'user' ? 'environment' : 'user';
     setFacingMode(next);
+    poseResultRef.current = null;
+    smooth.current.ready = false;
     startCamera(next);
   };
 
@@ -384,120 +349,94 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
   const handlePhoto = useCallback(() => {
     const video = videoRef.current;
     const overlay = overlayCanvasRef.current;
-    const canvas = canvasRef.current;
+    const canvas = captureCanvasRef.current;
     if (!video || !canvas) return;
-
     const w = video.videoWidth || 640;
     const h = video.videoHeight || 480;
-    canvas.width = w;
-    canvas.height = h;
+    canvas.width = w; canvas.height = h;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-
-    // Зеркалим для фронтальной
-    if (facingMode === 'user') { ctx.translate(w, 0); ctx.scale(-1, 1); }
+    const mirrored = facingModeRef.current === 'user';
+    if (mirrored) { ctx.translate(w, 0); ctx.scale(-1, 1); }
     ctx.drawImage(video, 0, 0, w, h);
-    if (facingMode === 'user') ctx.setTransform(1, 0, 0, 1, 0, 0);
-
-    // Накладываем одежду из overlay canvas
-    if (overlay) ctx.drawImage(overlay, 0, 0, w, h);
-
+    if (mirrored) { ctx.translate(w, 0); ctx.scale(-1, 1); } // reset
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    // overlay canvas тоже зеркалится через CSS — рисуем его зеркально
+    if (overlay) {
+      if (mirrored) { ctx.translate(w, 0); ctx.scale(-1, 1); }
+      ctx.drawImage(overlay, 0, 0, w, h);
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+    }
     setPhotoStatus('flash');
-    setTimeout(() => setPhotoStatus('done'), 200);
+    setTimeout(() => setPhotoStatus('done'), 180);
     setTimeout(() => setPhotoStatus('idle'), 2500);
-
     canvas.toBlob(blob => {
       if (!blob) return;
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.href = url;
-      a.download = `fitar-${Date.now()}.jpg`;
-      a.click();
+      a.href = url; a.download = `fitar-${Date.now()}.jpg`; a.click();
       URL.revokeObjectURL(url);
     }, 'image/jpeg', 0.92);
-  }, [facingMode]);
+  }, []);
 
   const sizeLabel = manualSize < 30 ? 'XS' : manualSize < 46 ? 'S' : manualSize < 62 ? 'M' : manualSize < 78 ? 'L' : 'XL';
 
+  const resetToUpload = () => {
+    stopCamera();
+    setStep('upload');
+    setClothImage(null);
+    setCameraStatus('idle');
+    clothImgRef.current = null;
+    poseResultRef.current = null;
+  };
+
   return (
     <div className="flex flex-col h-full relative">
-      <canvas ref={canvasRef} className="hidden" />
+      <canvas ref={captureCanvasRef} className="hidden" />
       <input ref={fileInputRef} type="file" accept="image/*" className="hidden" onChange={handleFileSelect} />
 
       {/* Заголовок */}
-      <div className="px-5 pt-5 pb-3 flex items-center justify-between animate-fade-in-up flex-shrink-0">
+      <div className="px-5 pt-5 pb-3 flex items-center justify-between flex-shrink-0 animate-fade-in-up">
         <div>
           <h1 className="font-montserrat font-900 text-2xl text-white leading-tight">
             {lang === 'ru' ? <>AR <span className="text-gradient">Примерочная</span></> : <><span className="text-gradient">AR</span> Fitting</>}
           </h1>
-          <p className="text-xs mt-0.5" style={{
-            color: poseStatus === 'found' ? '#4ade80' : poseStatus === 'detecting' ? '#facc15' : 'rgba(255,255,255,0.4)'
-          }}>
-            {step === 'tryon' && cameraStatus === 'active'
-              ? poseStatus === 'found' ? t.active
-              : poseStatus === 'detecting' ? t.detectingPose
-              : t.subtitle
-              : t.subtitle}
+          <p className="text-xs mt-0.5 transition-colors duration-500"
+            style={{ color: poseFoundUI ? '#4ade80' : 'rgba(255,255,255,0.4)' }}>
+            {cameraStatus === 'active' ? (poseFoundUI ? t.poseFound : t.poseSearch) : t.subtitle}
           </p>
         </div>
-        <div className="flex gap-2">
-          {step === 'tryon' && cameraStatus === 'active' && (
-            <button onClick={() => setShowManual(v => !v)}
-              className="glass rounded-2xl p-2.5"
-              title="Ручное управление">
-              <Icon name="SlidersHorizontal" size={16} className="text-white/50" />
-            </button>
-          )}
-          {step === 'tryon' && (
-            <button
-              onClick={() => { stopCamera(); setStep('upload'); setClothImage(null); setCameraStatus('idle'); setPoseStatus('none'); }}
-              className="glass rounded-2xl px-3 py-2 flex items-center gap-1.5">
-              <Icon name="Upload" size={13} className="text-purple-400" />
-              <span className="text-xs text-white/60 font-600">{t.changeCloth}</span>
-            </button>
-          )}
-        </div>
+        {step === 'tryon' && (
+          <button onClick={resetToUpload} className="glass rounded-2xl px-3 py-2 flex items-center gap-1.5">
+            <Icon name="Upload" size={13} className="text-purple-400" />
+            <span className="text-xs text-white/60 font-600">{t.changeCloth}</span>
+          </button>
+        )}
       </div>
 
       {/* ШАГ 1: Загрузка */}
       {step === 'upload' && (
         <div className="flex-1 flex flex-col items-center justify-center px-6 gap-5 animate-scale-in pb-16">
-          <div className="relative">
-            <div className="w-36 h-36 rounded-3xl glass flex items-center justify-center animate-float"
-              style={{ border: '2px solid rgba(168,85,247,0.4)' }}>
-              <span className="text-6xl">👗</span>
-            </div>
-            {/* Нейросеть-индикатор */}
-            <div className="absolute -bottom-2 -right-2 glass rounded-xl px-2 py-1 flex items-center gap-1"
-              style={{ border: '1px solid rgba(6,182,212,0.4)' }}>
-              <div className={`w-1.5 h-1.5 rounded-full ${poseModelReady ? 'bg-green-400' : 'bg-yellow-400 animate-pulse'}`} />
-              <span className="text-xs text-white/50">{poseModelReady ? 'AI ready' : t.noAI}</span>
-            </div>
+          <div className="w-36 h-36 rounded-3xl glass flex items-center justify-center animate-float"
+            style={{ border: '2px solid rgba(168,85,247,0.4)' }}>
+            <span className="text-6xl">👗</span>
           </div>
-
           <div className="text-center">
             <h2 className="font-montserrat font-800 text-xl text-white mb-1">{t.uploadBtn}</h2>
             <p className="text-sm text-white/40">{t.uploadHint}</p>
           </div>
-
           {bgError && (
-            <div className="glass rounded-2xl px-4 py-3 w-full text-center"
+            <div className="glass rounded-2xl px-4 py-3 w-full text-center text-sm"
               style={{ border: '1px solid rgba(239,68,68,0.3)', color: '#f87171' }}>
               {bgError}
             </div>
           )}
-
           <button onClick={() => fileInputRef.current?.click()}
             className="btn-primary px-8 py-4 font-montserrat font-700 text-base flex items-center gap-3 rounded-2xl w-full justify-center">
             <Icon name="ImagePlus" size={22} className="text-white" />
             {t.uploadBtn}
           </button>
-
-          <p className="text-xs text-white/20 text-center">
-            {lang === 'ru' ? 'ИИ уберёт фон → нейросеть наденет одежду на тебя' : 'AI removes background → neural net fits clothing on you'}
-          </p>
-
-          {/* Подсказка */}
+          <p className="text-xs text-white/20 text-center">{t.aiHint}</p>
           <div className="absolute bottom-3 left-4 right-4">
             <div className="glass rounded-xl px-4 py-2.5 text-center">
               <p className="text-xs text-white/40">{t.tips[tipIndex]}</p>
@@ -512,7 +451,7 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
           <div className="relative w-28 h-28">
             <div className="absolute inset-0 rounded-full border-2 border-purple-500/20 border-t-purple-500 animate-spin" />
             <div className="absolute inset-3 rounded-full border-2 border-cyan-500/20 border-b-cyan-400 animate-spin"
-              style={{ animationDirection: 'reverse', animationDuration: '1.5s' }} />
+              style={{ animationDirection: 'reverse', animationDuration: '1.4s' }} />
             <div className="absolute inset-0 flex items-center justify-center text-3xl">✂️</div>
           </div>
           <div className="text-center px-8">
@@ -531,33 +470,21 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
       {/* ШАГ 3: Примерка */}
       {step === 'tryon' && (
         <>
-          {/* AR Вьюпорт */}
-          <div className="mx-5 relative rounded-3xl overflow-hidden flex-shrink-0" style={{ height: '330px' }}>
-
-            {/* Видео с камеры */}
+          <div className="mx-5 relative rounded-3xl overflow-hidden flex-shrink-0" style={{ height: '320px' }}>
+            {/* Видео */}
             <video ref={videoRef} playsInline muted
               className="absolute inset-0 w-full h-full object-cover"
-              style={{
-                transform: facingMode === 'user' ? 'scaleX(-1)' : 'none',
-                display: cameraStatus === 'active' ? 'block' : 'none',
-              }}
+              style={{ transform: facingMode === 'user' ? 'scaleX(-1)' : 'none', display: cameraStatus === 'active' ? 'block' : 'none' }}
             />
-
-            {/* Overlay canvas — одежда рендерится сюда нейросетью */}
+            {/* Overlay canvas — зеркалится вместе с видео */}
             <canvas ref={overlayCanvasRef}
               className="absolute inset-0 w-full h-full"
-              style={{
-                transform: facingMode === 'user' ? 'scaleX(-1)' : 'none',
-                display: cameraStatus === 'active' ? 'block' : 'none',
-                objectFit: 'cover',
-                pointerEvents: 'none',
-              }}
+              style={{ transform: facingMode === 'user' ? 'scaleX(-1)' : 'none', display: cameraStatus === 'active' ? 'block' : 'none', pointerEvents: 'none' }}
             />
 
-            {/* Фон когда камера не активна */}
+            {/* Фон */}
             {cameraStatus !== 'active' && (
-              <div className="absolute inset-0"
-                style={{ background: 'linear-gradient(160deg, #0f1729 0%, #1a0f2e 50%, #0d1a2e 100%)' }}>
+              <div className="absolute inset-0" style={{ background: 'linear-gradient(160deg, #0f1729 0%, #1a0f2e 50%, #0d1a2e 100%)' }}>
                 <div className="absolute inset-0 opacity-10"
                   style={{ backgroundImage: 'linear-gradient(rgba(6,182,212,0.5) 1px, transparent 1px), linear-gradient(90deg, rgba(6,182,212,0.5) 1px, transparent 1px)', backgroundSize: '30px 30px' }} />
               </div>
@@ -569,31 +496,29 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
             <div className="ar-corner ar-corner-bl animate-ar-pulse" />
             <div className="ar-corner ar-corner-br animate-ar-pulse" />
 
-            {/* Линия сканирования */}
             {scanning && (
               <div className="absolute left-0 right-0 h-0.5 animate-ar-scan z-10"
                 style={{ background: 'linear-gradient(90deg, transparent, #06b6d4, transparent)' }} />
             )}
 
-            {/* Статус нейросети поверх камеры */}
+            {/* Pose статус */}
             {cameraStatus === 'active' && (
-              <div className="absolute top-3 left-3 z-20 flex items-center gap-1.5 glass rounded-xl px-2.5 py-1.5">
-                <div className={`w-2 h-2 rounded-full ${poseStatus === 'found' ? 'bg-green-400' : 'bg-yellow-400 animate-pulse'}`} />
-                <span className="text-xs font-600" style={{ color: poseStatus === 'found' ? '#4ade80' : '#facc15' }}>
-                  {poseStatus === 'found' ? (lang === 'ru' ? 'Поза найдена' : 'Pose found') : (lang === 'ru' ? 'Поиск...' : 'Searching...')}
+              <div className="absolute bottom-3 left-3 z-20 glass rounded-xl px-2.5 py-1.5 flex items-center gap-1.5">
+                <div className={`w-2 h-2 rounded-full ${poseFoundUI ? 'bg-green-400' : 'bg-yellow-400 animate-pulse'}`} />
+                <span className="text-xs font-600" style={{ color: poseFoundUI ? '#4ade80' : '#facc15' }}>
+                  {poseFoundUI ? t.poseFound : t.poseSearch}
                 </span>
               </div>
             )}
 
-            {/* Кнопка переключения камеры */}
+            {/* Flip */}
             {cameraStatus === 'active' && (
-              <button onClick={handleFlip}
-                className="absolute top-3 right-3 glass rounded-xl p-2 z-20 transition-all hover:scale-110 active:scale-95">
+              <button onClick={handleFlip} className="absolute top-3 right-3 glass rounded-xl p-2 z-20 active:scale-90 transition-transform">
                 <Icon name="RefreshCw" size={15} className="text-white/70" />
               </button>
             )}
 
-            {/* Превью одежды + кнопка старта (камера не активна) */}
+            {/* Превью + старт */}
             {clothImage && cameraStatus !== 'active' && cameraStatus !== 'requesting' && (
               <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 z-10">
                 <img src={clothImage} alt="" className="w-28 object-contain animate-float"
@@ -609,7 +534,7 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
             {cameraStatus === 'requesting' && (
               <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 z-10">
                 <div className="w-10 h-10 rounded-full border-2 border-purple-500/30 border-t-purple-500 animate-spin" />
-                <p className="text-white/50 text-sm">{lang === 'ru' ? 'Запрашиваю камеру...' : 'Requesting camera...'}</p>
+                <p className="text-white/50 text-sm">{lang === 'ru' ? 'Запрашиваю камеру...' : 'Starting camera...'}</p>
               </div>
             )}
 
@@ -631,42 +556,42 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
               </div>
             )}
 
-            {/* Вспышка фото */}
-            {photoStatus === 'flash' && (
-              <div className="absolute inset-0 z-50 pointer-events-none"
-                style={{ background: 'rgba(255,255,255,0.9)' }} />
-            )}
+            {photoStatus === 'flash' && <div className="absolute inset-0 z-50 pointer-events-none bg-white/90" />}
 
             <div className="absolute bottom-0 left-0 right-0 h-10 pointer-events-none z-10"
-              style={{ background: 'linear-gradient(to top, rgba(8,11,20,0.6), transparent)' }} />
+              style={{ background: 'linear-gradient(to top, rgba(8,11,20,0.5), transparent)' }} />
           </div>
 
-          {/* Ручные регуляторы (когда поза не найдена или пользователь открыл) */}
-          {cameraStatus === 'active' && (showManual || poseStatus !== 'found') && (
-            <div className="mx-5 mt-3 glass rounded-2xl p-3 animate-scale-in space-y-2 flex-shrink-0">
-              <p className="text-xs text-white/30 text-center mb-1">
-                {lang === 'ru' ? 'Ручная настройка' : 'Manual adjustment'}
+          {/* Ручные регуляторы */}
+          {cameraStatus === 'active' && (
+            <div className="mx-5 mt-3 glass rounded-2xl p-3 space-y-2 flex-shrink-0">
+              <p className="text-xs text-white/30 text-center">
+                {poseFoundUI ? (lang === 'ru' ? 'Нейросеть управляет · коррекция вручную' : 'AI tracking · manual correction') : t.manualMode}
               </p>
               <div className="flex items-center gap-3">
                 <Icon name="Maximize2" size={14} className="text-purple-400 flex-shrink-0" />
                 <div className="flex-1">
                   <div className="flex justify-between text-xs text-white/40 mb-1">
-                    <span>{lang === 'ru' ? 'Размер' : 'Size'}</span>
+                    <span>{t.size}</span>
                     <span className="text-purple-400 font-600">{sizeLabel}</span>
                   </div>
                   <input type="range" min="10" max="100" value={manualSize}
-                    onChange={e => setManualSize(Number(e.target.value))} className="w-full cursor-pointer" />
+                    onChange={e => { setManualSize(Number(e.target.value)); poseResultRef.current = null; smooth.current.ready = false; }}
+                    className="w-full cursor-pointer" />
                 </div>
               </div>
               <div className="flex items-center gap-3">
                 <Icon name="MoveVertical" size={14} className="text-cyan-400 flex-shrink-0" />
                 <div className="flex-1">
                   <div className="flex justify-between text-xs text-white/40 mb-1">
-                    <span>{lang === 'ru' ? 'Положение' : 'Position'}</span>
-                    <span className="text-cyan-400 font-600">{manualPosY < 30 ? (lang === 'ru' ? 'Выше' : 'Up') : manualPosY > 60 ? (lang === 'ru' ? 'Ниже' : 'Down') : (lang === 'ru' ? 'Центр' : 'Center')}</span>
+                    <span>{t.position}</span>
+                    <span className="text-cyan-400 font-600">
+                      {manualPosY < 25 ? (lang === 'ru' ? 'Выше' : 'Up') : manualPosY > 55 ? (lang === 'ru' ? 'Ниже' : 'Down') : (lang === 'ru' ? 'Центр' : 'Center')}
+                    </span>
                   </div>
                   <input type="range" min="5" max="80" value={manualPosY}
-                    onChange={e => setManualPosY(Number(e.target.value))} className="w-full cursor-pointer" />
+                    onChange={e => { setManualPosY(Number(e.target.value)); poseResultRef.current = null; smooth.current.ready = false; }}
+                    className="w-full cursor-pointer" />
                 </div>
               </div>
             </div>
@@ -674,7 +599,7 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
 
           {/* Кнопки */}
           {cameraStatus === 'active' && (
-            <div className="px-5 mt-3 flex gap-3 animate-slide-in-bottom flex-shrink-0">
+            <div className="px-5 mt-3 flex gap-3 flex-shrink-0">
               <button onClick={handlePhoto}
                 className="flex-shrink-0 w-14 h-12 rounded-2xl flex items-center justify-center transition-all duration-200 active:scale-90"
                 style={{
@@ -697,10 +622,9 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
           )}
 
           {photoStatus === 'done' && (
-            <p className="text-center text-xs text-cyan-400 mt-2 animate-fade-in-up flex-shrink-0">{t.photoSaved}</p>
+            <p className="text-center text-xs text-cyan-400 mt-2 flex-shrink-0 animate-fade-in-up">{t.photoSaved}</p>
           )}
 
-          {/* Подсказка */}
           <div className="mx-5 mt-3 mb-1 flex-shrink-0">
             <div className="glass rounded-xl px-4 py-2.5">
               <p className="text-xs text-white/35 text-center">{t.tips[tipIndex]}</p>
