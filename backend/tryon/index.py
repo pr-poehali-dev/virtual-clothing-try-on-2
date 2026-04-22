@@ -1,5 +1,6 @@
 import json
 import os
+import base64
 import requests
 import boto3
 import uuid
@@ -7,14 +8,48 @@ import uuid
 
 CORS = {'Access-Control-Allow-Origin': '*'}
 
-# Replicate IDM-VTON model
-REPLICATE_MODEL = 'cuuupid/idm-vton:c871bb9b046607b680449ecbae55fd8c6d945e0a1948644bf2361b3d021d3ff4'
+# Replicate IDM-VTON model version
+REPLICATE_VERSION = 'c871bb9b046607b680449ecbae55fd8c6d945e0a1948644bf2361b3d021d3ff4'
+
+
+def s3_client():
+    return boto3.client(
+        's3',
+        endpoint_url='https://bucket.poehali.dev',
+        aws_access_key_id=os.environ['AWS_ACCESS_KEY_ID'],
+        aws_secret_access_key=os.environ['AWS_SECRET_ACCESS_KEY'],
+    )
+
+
+def upload_base64_to_s3(data_url: str, folder: str) -> str:
+    """Загружает base64 изображение в S3, возвращает публичный CDN URL."""
+    # data_url = "data:image/jpeg;base64,/9j/..."
+    header, b64data = data_url.split(',', 1)
+    ext = 'jpg'
+    if 'png' in header:
+        ext = 'png'
+    elif 'webp' in header:
+        ext = 'webp'
+
+    img_bytes = base64.b64decode(b64data)
+    file_key = f'{folder}/{uuid.uuid4()}.{ext}'
+
+    s3 = s3_client()
+    s3.put_object(
+        Bucket='files',
+        Key=file_key,
+        Body=img_bytes,
+        ContentType=f'image/{ext}',
+    )
+
+    cdn_url = f"https://cdn.poehali.dev/projects/{os.environ['AWS_ACCESS_KEY_ID']}/bucket/{file_key}"
+    return cdn_url
 
 
 def handler(event: dict, context) -> dict:
     """
     Виртуальная примерка одежды через Replicate IDM-VTON.
-    Принимает base64 фото человека и одежды, возвращает URL результата.
+    Загружает фото в S3, запускает модель, возвращает URL результата.
     """
     if event.get('httpMethod') == 'OPTIONS':
         return {
@@ -32,10 +67,9 @@ def handler(event: dict, context) -> dict:
     if not api_key:
         return {'statusCode': 500, 'headers': CORS, 'body': json.dumps({'error': 'REPLICATE_API_KEY не настроен'})}
 
-    headers = {
+    rep_headers = {
         'Authorization': f'Bearer {api_key}',
         'Content-Type': 'application/json',
-        'Prefer': 'wait=5',
     }
 
     body = json.loads(event.get('body') or '{}')
@@ -43,24 +77,28 @@ def handler(event: dict, context) -> dict:
 
     # Запуск задачи примерки
     if action == 'run':
-        model_image = body.get('model_image')
-        garment_image = body.get('garment_image')
-        category = body.get('category', 'upper_body')
+        model_image_b64 = body.get('model_image')
+        garment_image_b64 = body.get('garment_image')
+        category = body.get('category', 'tops')
 
-        if not model_image or not garment_image:
+        if not model_image_b64 or not garment_image_b64:
             return {'statusCode': 400, 'headers': CORS, 'body': json.dumps({'error': 'Нужны model_image и garment_image'})}
+
+        # Загружаем оба фото в S3 и получаем публичные URL
+        human_url = upload_base64_to_s3(model_image_b64, 'tryon-uploads/human')
+        garm_url = upload_base64_to_s3(garment_image_b64, 'tryon-uploads/garment')
 
         # Маппинг категорий
         cat_map = {'tops': 'upper_body', 'bottoms': 'lower_body', 'one-pieces': 'dresses'}
-        garment_desc_map = {'tops': 'upper body clothing', 'bottoms': 'lower body clothing', 'one-pieces': 'a dress'}
+        desc_map = {'tops': 'a shirt or top garment', 'bottoms': 'pants or skirt', 'one-pieces': 'a dress'}
         rep_category = cat_map.get(category, 'upper_body')
-        garment_desc = garment_desc_map.get(category, 'upper body clothing')
+        garment_desc = desc_map.get(category, 'a clothing item')
 
         payload = {
-            'version': REPLICATE_MODEL.split(':')[1],
+            'version': REPLICATE_VERSION,
             'input': {
-                'human_img': model_image,
-                'garm_img': garment_image,
+                'human_img': human_url,
+                'garm_img': garm_url,
                 'garment_des': garment_desc,
                 'category': rep_category,
                 'is_checked': True,
@@ -72,7 +110,7 @@ def handler(event: dict, context) -> dict:
 
         resp = requests.post(
             'https://api.replicate.com/v1/predictions',
-            headers=headers,
+            headers=rep_headers,
             json=payload,
             timeout=30,
         )
@@ -80,17 +118,17 @@ def handler(event: dict, context) -> dict:
         data = resp.json()
 
         if resp.status_code not in (200, 201):
+            err_detail = data.get('detail', '') or str(data)
             return {
-                'statusCode': resp.status_code,
+                'statusCode': 500,
                 'headers': CORS,
-                'body': json.dumps({'error': data.get('detail', str(data))}),
+                'body': json.dumps({'error': f'Replicate: {err_detail}'}),
             }
 
         prediction_id = data.get('id')
         status = data.get('status', 'starting')
         output = data.get('output')
 
-        # Если уже готово (Prefer: wait отработал)
         if status == 'succeeded' and output:
             result_url = output[0] if isinstance(output, list) else output
             return {
@@ -113,7 +151,7 @@ def handler(event: dict, context) -> dict:
 
         resp = requests.get(
             f'https://api.replicate.com/v1/predictions/{prediction_id}',
-            headers=headers,
+            headers=rep_headers,
             timeout=15,
         )
 
@@ -126,16 +164,12 @@ def handler(event: dict, context) -> dict:
         if status == 'succeeded' and output:
             result_url = output[0] if isinstance(output, list) else output
 
-        mapped_status = 'completed' if status == 'succeeded' else ('failed' if status == 'failed' else 'processing')
+        mapped = 'completed' if status == 'succeeded' else ('failed' if status == 'failed' else 'processing')
 
         return {
             'statusCode': 200,
             'headers': CORS,
-            'body': json.dumps({
-                'status': mapped_status,
-                'result_url': result_url,
-                'error': error,
-            }),
+            'body': json.dumps({'status': mapped, 'result_url': result_url, 'error': error}),
         }
 
     # Сохранение результата в S3
@@ -145,29 +179,13 @@ def handler(event: dict, context) -> dict:
             return {'statusCode': 400, 'headers': CORS, 'body': json.dumps({'error': 'Нужен image_url'})}
 
         img_resp = requests.get(image_url, timeout=30)
-        img_data = img_resp.content
+        img_bytes = img_resp.content
 
-        s3 = boto3.client(
-            's3',
-            endpoint_url='https://bucket.poehali.dev',
-            aws_access_key_id=os.environ['AWS_ACCESS_KEY_ID'],
-            aws_secret_access_key=os.environ['AWS_SECRET_ACCESS_KEY'],
-        )
-
+        s3 = s3_client()
         file_key = f'tryon-results/{uuid.uuid4()}.png'
-        s3.put_object(
-            Bucket='files',
-            Key=file_key,
-            Body=img_data,
-            ContentType='image/png',
-        )
+        s3.put_object(Bucket='files', Key=file_key, Body=img_bytes, ContentType='image/png')
 
         cdn_url = f"https://cdn.poehali.dev/projects/{os.environ['AWS_ACCESS_KEY_ID']}/bucket/{file_key}"
-
-        return {
-            'statusCode': 200,
-            'headers': CORS,
-            'body': json.dumps({'saved_url': cdn_url}),
-        }
+        return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({'saved_url': cdn_url})}
 
     return {'statusCode': 400, 'headers': CORS, 'body': json.dumps({'error': 'Неизвестный action'})}
