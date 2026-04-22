@@ -70,18 +70,17 @@ function AppContent() {
         </div>
 
         {/* Нижняя навигация */}
-        <div className="flex-shrink-0 px-4 pb-4 pt-2 relative z-20">
-          <div className="glass-strong rounded-3xl px-2 py-3 flex justify-around items-center"
-            style={{
-              boxShadow: '0 -4px 40px rgba(0,0,0,0.4), 0 0 0 1px rgba(255,255,255,0.06)',
-            }}>
+        <div className="flex-shrink-0 px-3 pt-2 relative z-20"
+          style={{ paddingBottom: 'max(12px, env(safe-area-inset-bottom))' }}>
+          <div className="glass-strong rounded-3xl py-2 flex items-center"
+            style={{ boxShadow: '0 -4px 40px rgba(0,0,0,0.4), 0 0 0 1px rgba(255,255,255,0.06)' }}>
             {TABS.map(t => {
               const isActive = tab === t.key;
               return (
                 <button
                   key={t.key}
                   onClick={() => setTab(t.key)}
-                  className="nav-item flex flex-col items-center gap-1 px-4 py-1 rounded-2xl transition-all duration-300"
+                  className="flex-1 flex flex-col items-center gap-0.5 py-1 rounded-2xl transition-all duration-300"
                   style={isActive ? { background: 'rgba(168,85,247,0.15)' } : {}}>
 
                   <div className="w-8 h-8 rounded-xl flex items-center justify-center transition-all duration-300"
@@ -96,7 +95,7 @@ function AppContent() {
                     />
                   </div>
 
-                  <span className="text-xs font-montserrat font-600 transition-all duration-300"
+                  <span className="text-xs font-montserrat font-600 transition-all duration-300 leading-tight"
                     style={{ color: isActive ? '#c084fc' : 'rgba(255,255,255,0.25)' }}>
                     {t.label}
                   </span>
