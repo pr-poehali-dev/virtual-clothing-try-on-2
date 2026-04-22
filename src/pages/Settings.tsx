@@ -1,6 +1,8 @@
 import { useState } from 'react';
 import Icon from '@/components/ui/icon';
 
+type Lang = 'ru' | 'en';
+
 function Toggle({ on, onChange }: { on: boolean; onChange: () => void }) {
   return (
     <button onClick={onChange}
@@ -11,38 +13,78 @@ function Toggle({ on, onChange }: { on: boolean; onChange: () => void }) {
   );
 }
 
-export default function Settings() {
+const T = {
+  ru: {
+    title: 'Настройки',
+    subtitle: 'Персонализируй приложение',
+    langLabel: 'Язык интерфейса',
+    permissions: 'Разрешения',
+    notifications: 'Уведомления',
+    privacy: 'Конфиденциальность',
+    camera: 'Доступ к камере',
+    cameraDesc: 'Для AR примерки',
+    push: 'Push-уведомления',
+    pushDesc: 'Новинки и акции',
+    sound: 'Звуки',
+    soundDesc: 'Звуки интерфейса',
+    analytics: 'Аналитика',
+    analyticsDesc: 'Помогает улучшить приложение',
+    version: 'FitAR v1.0.0 · 2026',
+    made: 'Made with ✨ on poehali.dev',
+  },
+  en: {
+    title: 'Settings',
+    subtitle: 'Personalize the app',
+    langLabel: 'Interface language',
+    permissions: 'Permissions',
+    notifications: 'Notifications',
+    privacy: 'Privacy',
+    camera: 'Camera access',
+    cameraDesc: 'Required for AR try-on',
+    push: 'Push notifications',
+    pushDesc: 'New arrivals and deals',
+    sound: 'Sounds',
+    soundDesc: 'Interface sounds',
+    analytics: 'Analytics',
+    analyticsDesc: 'Helps improve the app',
+    version: 'FitAR v1.0.0 · 2026',
+    made: 'Made with ✨ on poehali.dev',
+  },
+};
+
+interface SettingsProps {
+  lang: Lang;
+  onLangChange: (l: Lang) => void;
+}
+
+export default function Settings({ lang, onLangChange }: SettingsProps) {
+  const t = T[lang];
   const [notifs, setNotifs] = useState(true);
   const [camera, setCamera] = useState(false);
   const [sound, setSound] = useState(true);
   const [analytics, setAnalytics] = useState(false);
-  const [lang, setLang] = useState('ru');
 
-  const sections = [
+  type SectionIcon = 'Shield' | 'Bell' | 'Lock';
+  type ItemIcon = 'Camera' | 'Bell' | 'Volume2' | 'BarChart2';
+
+  const sections: {
+    title: string; icon: SectionIcon; color: string;
+    items: { label: string; desc: string; value: boolean; toggle: () => void; icon: ItemIcon }[]
+  }[] = [
     {
-      title: 'Разрешения',
-      icon: 'Shield',
-      color: '#06b6d4',
+      title: t.permissions, icon: 'Shield', color: '#06b6d4',
+      items: [{ label: t.camera, desc: t.cameraDesc, value: camera, toggle: () => setCamera(v => !v), icon: 'Camera' }]
+    },
+    {
+      title: t.notifications, icon: 'Bell', color: '#a855f7',
       items: [
-        { label: 'Доступ к камере', desc: 'Для AR примерки', value: camera, toggle: () => setCamera(v => !v), icon: 'Camera' },
+        { label: t.push, desc: t.pushDesc, value: notifs, toggle: () => setNotifs(v => !v), icon: 'Bell' },
+        { label: t.sound, desc: t.soundDesc, value: sound, toggle: () => setSound(v => !v), icon: 'Volume2' },
       ]
     },
     {
-      title: 'Уведомления',
-      icon: 'Bell',
-      color: '#a855f7',
-      items: [
-        { label: 'Push-уведомления', desc: 'Новинки и акции', value: notifs, toggle: () => setNotifs(v => !v), icon: 'Bell' },
-        { label: 'Звуки', desc: 'Звуки интерфейса', value: sound, toggle: () => setSound(v => !v), icon: 'Volume2' },
-      ]
-    },
-    {
-      title: 'Конфиденциальность',
-      icon: 'Lock',
-      color: '#f97316',
-      items: [
-        { label: 'Аналитика', desc: 'Помогает улучшить приложение', value: analytics, toggle: () => setAnalytics(v => !v), icon: 'BarChart2' },
-      ]
+      title: t.privacy, icon: 'Lock', color: '#f97316',
+      items: [{ label: t.analytics, desc: t.analyticsDesc, value: analytics, toggle: () => setAnalytics(v => !v), icon: 'BarChart2' }]
     },
   ];
 
@@ -50,37 +92,31 @@ export default function Settings() {
     <div className="flex flex-col h-full overflow-y-auto no-scrollbar">
       <div className="px-5 pt-6 pb-4 animate-fade-in-up">
         <h1 className="font-montserrat font-900 text-2xl text-white">
-          Настрой<span className="text-gradient">ки</span>
+          {lang === 'ru' ? <>Настрой<span className="text-gradient">ки</span></> : <><span className="text-gradient">Set</span>tings</>}
         </h1>
-        <p className="text-sm text-white/40 mt-0.5">Персонализируй приложение</p>
+        <p className="text-sm text-white/40 mt-0.5">{t.subtitle}</p>
       </div>
 
       {/* Язык */}
       <div className="px-5 mb-4 animate-fade-in-up delay-100">
         <div className="glass rounded-2xl p-4">
           <div className="flex items-center gap-3 mb-3">
-            <div className="w-9 h-9 rounded-xl flex items-center justify-center"
-              style={{ background: '#ec489920' }}>
+            <div className="w-9 h-9 rounded-xl flex items-center justify-center" style={{ background: '#ec489920' }}>
               <Icon name="Globe" size={18} style={{ color: '#ec4899' }} />
             </div>
-            <span className="font-600 text-white text-sm">Язык интерфейса</span>
+            <span className="font-600 text-white text-sm">{t.langLabel}</span>
           </div>
           <div className="flex gap-2">
-            {[
-              { code: 'ru', label: '🇷🇺 Русский' },
-              { code: 'en', label: '🇬🇧 English' },
-              { code: 'tr', label: '🇹🇷 Türkçe' },
-            ].map(l => (
-              <button key={l.code} onClick={() => setLang(l.code)}
-                className={`flex-1 py-2.5 rounded-xl text-xs font-montserrat font-600 transition-all duration-300 ${
-                  lang === l.code
-                    ? 'text-white glow-purple'
-                    : 'glass text-white/40'
-                }`}
+            {([
+              { code: 'ru' as Lang, label: '🇷🇺 Русский' },
+              { code: 'en' as Lang, label: '🇬🇧 English' },
+            ]).map(l => (
+              <button key={l.code} onClick={() => onLangChange(l.code)}
+                className="flex-1 py-2.5 rounded-xl text-sm font-montserrat font-600 transition-all duration-300"
                 style={lang === l.code ? {
                   background: 'linear-gradient(135deg, rgba(168,85,247,0.3), rgba(6,182,212,0.3))',
-                  border: '1px solid rgba(168,85,247,0.5)'
-                } : {}}>
+                  border: '1px solid rgba(168,85,247,0.5)', color: 'white',
+                } : { background: 'rgba(255,255,255,0.05)', color: 'rgba(255,255,255,0.4)', border: '1px solid transparent' }}>
                 {l.label}
               </button>
             ))}
@@ -88,29 +124,23 @@ export default function Settings() {
         </div>
       </div>
 
-      {/* Секции настроек */}
+      {/* Секции */}
       <div className="px-5 space-y-4 pb-6">
         {sections.map((section, si) => (
-          <div key={section.title} className={`glass rounded-2xl overflow-hidden animate-fade-in-up`}
+          <div key={section.title} className="glass rounded-2xl overflow-hidden animate-fade-in-up"
             style={{ animationDelay: `${(si + 2) * 0.1}s` }}>
             <div className="px-4 py-3 flex items-center gap-2"
               style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
-              <div className="w-7 h-7 rounded-lg flex items-center justify-center"
-                style={{ background: `${section.color}20` }}>
-                <Icon name={section.icon as 'Shield' | 'Bell' | 'Lock'} size={14} style={{ color: section.color }} />
+              <div className="w-7 h-7 rounded-lg flex items-center justify-center" style={{ background: `${section.color}20` }}>
+                <Icon name={section.icon} size={14} style={{ color: section.color }} />
               </div>
-              <span className="text-xs font-montserrat font-700 uppercase tracking-wider text-white/50">
-                {section.title}
-              </span>
+              <span className="text-xs font-montserrat font-700 uppercase tracking-wider text-white/50">{section.title}</span>
             </div>
-
             {section.items.map((item, ii) => (
-              <div key={item.label}
-                className="px-4 py-4 flex items-center gap-3"
+              <div key={item.label} className="px-4 py-4 flex items-center gap-3"
                 style={ii < section.items.length - 1 ? { borderBottom: '1px solid rgba(255,255,255,0.04)' } : {}}>
-                <div className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0"
-                  style={{ background: `${section.color}15` }}>
-                  <Icon name={item.icon as 'Camera' | 'Bell' | 'Volume2' | 'BarChart2'} size={16} style={{ color: section.color }} />
+                <div className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0" style={{ background: `${section.color}15` }}>
+                  <Icon name={item.icon} size={16} style={{ color: section.color }} />
                 </div>
                 <div className="flex-1">
                   <div className="text-sm font-600 text-white">{item.label}</div>
@@ -122,10 +152,9 @@ export default function Settings() {
           </div>
         ))}
 
-        {/* Версия */}
         <div className="text-center pt-2">
-          <p className="text-xs text-white/20">FitAR v1.0.0 · 2026</p>
-          <p className="text-xs text-white/10 mt-1">Made with ✨ on poehali.dev</p>
+          <p className="text-xs text-white/20">{t.version}</p>
+          <p className="text-xs text-white/10 mt-1">{t.made}</p>
         </div>
       </div>
     </div>
