@@ -251,6 +251,50 @@
   }
 }
 
+/* Живая ткань — лёгкое покачивание одежды на камере */
+@keyframes cloth-sway {
+  0% {
+    transform: rotate(-1.5deg) scaleX(1);
+  }
+  25% {
+    transform: rotate(0.5deg) scaleX(1.01);
+  }
+  50% {
+    transform: rotate(1.5deg) scaleX(1);
+  }
+  75% {
+    transform: rotate(-0.5deg) scaleX(1.01);
+  }
+  100% {
+    transform: rotate(-1.5deg) scaleX(1);
+  }
+}
+@keyframes cloth-sway-mirror {
+  0% {
+    transform: scaleX(-1) rotate(-1.5deg);
+  }
+  25% {
+    transform: scaleX(-1) rotate(0.5deg);
+  }
+  50% {
+    transform: scaleX(-1) rotate(1.5deg);
+  }
+  75% {
+    transform: scaleX(-1) rotate(-0.5deg);
+  }
+  100% {
+    transform: scaleX(-1) rotate(-1.5deg);
+  }
+}
+.animate-cloth-sway {
+  animation: cloth-sway 3.5s ease-in-out infinite;
+  transform-origin: top center;
+}
+.animate-cloth-sway-mirror {
+  animation: cloth-sway-mirror 3.5s ease-in-out infinite;
+  transform-origin: top center;
+}
+
 .animate-ar-pulse {
   animation: ar-pulse 2s ease-in-out infinite;
 }

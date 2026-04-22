@@ -359,20 +359,41 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
                 style={{ background: 'linear-gradient(90deg, transparent, #06b6d4, transparent)' }} />
             )}
 
-            {/* Наложение одежды поверх видео */}
+            {/* Наложение одежды поверх видео — живая ткань */}
             {clothImage && cameraStatus === 'active' && (
               <div className="absolute inset-0 flex justify-center pointer-events-none" style={{ zIndex: 5 }}>
+                {/* Тень на полу под одеждой */}
+                <div className="absolute"
+                  style={{
+                    bottom: `${100 - clothTopPct - clothScale * 80}%`,
+                    width: `${clothScale * 70}%`,
+                    height: '12px',
+                    background: 'radial-gradient(ellipse, rgba(0,0,0,0.35) 0%, transparent 70%)',
+                    filter: 'blur(4px)',
+                    transform: 'translateX(-50%)',
+                    left: '50%',
+                  }}
+                />
                 <img
                   src={clothImage}
                   alt="clothing"
-                  className="absolute transition-all duration-200"
+                  className={facingMode === 'user' ? 'animate-cloth-sway-mirror' : 'animate-cloth-sway'}
                   style={{
+                    position: 'absolute',
                     top: `${clothTopPct}%`,
                     width: `${clothScale * 100}%`,
-                    maxWidth: '85%',
+                    maxWidth: '88%',
                     objectFit: 'contain',
-                    filter: 'drop-shadow(0 4px 24px rgba(168,85,247,0.5))',
-                    transform: facingMode === 'user' ? 'scaleX(-1)' : 'none',
+                    /* Реалистичная тень как от настоящей одежды */
+                    filter: [
+                      'drop-shadow(0 8px 16px rgba(0,0,0,0.55))',
+                      'drop-shadow(0 2px 4px rgba(0,0,0,0.35))',
+                    ].join(' '),
+                    /* Лёгкое смягчение краёв */
+                    WebkitMaskImage: 'radial-gradient(ellipse 100% 100% at 50% 50%, black 85%, transparent 100%)',
+                    maskImage: 'radial-gradient(ellipse 100% 100% at 50% 50%, black 85%, transparent 100%)',
+                    /* Переход плавный при движении ползунков */
+                    transition: 'top 0.15s ease, width 0.15s ease',
                   }}
                 />
               </div>
