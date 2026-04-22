@@ -7,11 +7,11 @@
       "expectedStatus": 200
     },
     {
-      "name": "Status check without id",
+      "name": "Run without token",
       "method": "POST",
       "path": "/",
-      "body": {"action": "status"},
-      "expectedStatus": 400,
+      "body": {"action": "run"},
+      "expectedStatus": 500,
       "bodyMatcher": "partial"
     }
   ]
