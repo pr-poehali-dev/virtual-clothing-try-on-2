@@ -73,6 +73,104 @@ const T = {
   },
 };
 
+// Типы одежды и их привязка к точкам тела
+type ClothType =
+  | 'top'       // куртка, свитер, рубашка — от шеи до пояса
+  | 'dress'     // платье — от шеи до колен
+  | 'bottom'    // брюки, юбка — от пояса до ног
+  | 'shoes'     // обувь — ступни
+  | 'hat'       // головной убор — голова
+  | 'accessory' // аксессуары — центр
+
+// MediaPipe landmark индексы
+const LM = {
+  NOSE: 0, LEFT_SHOULDER: 11, RIGHT_SHOULDER: 12,
+  LEFT_HIP: 23, RIGHT_HIP: 24,
+  LEFT_KNEE: 25, RIGHT_KNEE: 26,
+  LEFT_ANKLE: 27, RIGHT_ANKLE: 28,
+};
+
+interface ClothConfig {
+  type: ClothType;
+  label: string;
+  // коэффициенты относительно ширины плеч
+  widthMult: number;   // насколько одежда шире плеч
+  topOffset: number;   // смещение верха выше точки крепления (в долях высоты экрана)
+  bottomAnchor: 'hip' | 'knee' | 'ankle' | 'shoulder';
+}
+
+const CLOTH_CONFIGS: Record<ClothType, ClothConfig> = {
+  top:       { type: 'top',       label: 'Верх',    widthMult: 2.0, topOffset: 0.10, bottomAnchor: 'hip' },
+  dress:     { type: 'dress',     label: 'Платье',  widthMult: 2.1, topOffset: 0.10, bottomAnchor: 'knee' },
+  bottom:    { type: 'bottom',    label: 'Низ',     widthMult: 2.0, topOffset: 0.02, bottomAnchor: 'ankle' },
+  shoes:     { type: 'shoes',     label: 'Обувь',   widthMult: 1.2, topOffset: 0.05, bottomAnchor: 'ankle' },
+  hat:       { type: 'hat',       label: 'Головной убор', widthMult: 1.4, topOffset: 0.12, bottomAnchor: 'shoulder' },
+  accessory: { type: 'accessory', label: 'Аксессуар', widthMult: 1.0, topOffset: 0.0, bottomAnchor: 'shoulder' },
+};
+
+/**
+ * Определяет тип одежды по пропорциям изображения (PNG с прозрачным фоном).
+ * Анализирует bounding box непрозрачных пикселей через canvas.
+ */
+async function classifyClothing(imgSrc: string): Promise<ClothType> {
+  return new Promise(resolve => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      // Уменьшаем для скорости
+      const scale = Math.min(1, 200 / Math.max(img.width, img.height));
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      const ctx = canvas.getContext('2d')!;
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+
+      // Находим bounding box непрозрачных пикселей
+      let minX = canvas.width, maxX = 0, minY = canvas.height, maxY = 0;
+      for (let y = 0; y < canvas.height; y++) {
+        for (let x = 0; x < canvas.width; x++) {
+          const alpha = data[(y * canvas.width + x) * 4 + 3];
+          if (alpha > 30) {
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+          }
+        }
+      }
+
+      const bboxW = maxX - minX || canvas.width;
+      const bboxH = maxY - minY || canvas.height;
+      const aspect = bboxW / bboxH; // соотношение ширина/высота
+      // Где находится центр масс непрозрачных пикселей по Y
+      const centerYRel = (minY + bboxH / 2) / canvas.height;
+
+      // Классификация по пропорциям:
+      if (aspect > 2.5) {
+        // Очень широкое — головной убор или аксессуар
+        resolve(centerYRel < 0.4 ? 'hat' : 'accessory');
+      } else if (aspect < 0.5 && bboxH / canvas.height > 0.7) {
+        // Очень высокое и занимает весь кадр — платье
+        resolve('dress');
+      } else if (aspect < 0.7 && centerYRel > 0.55) {
+        // Высокое, центр внизу — брюки или обувь
+        resolve(aspect < 0.4 ? 'shoes' : 'bottom');
+      } else if (aspect > 0.8 && aspect < 2.2 && centerYRel < 0.55) {
+        // Примерно квадратное/широкое, центр вверху/середине — верх
+        resolve('top');
+      } else if (bboxH / canvas.height > 0.5 && aspect < 1.0) {
+        // Высокое — платье
+        resolve('dress');
+      } else {
+        resolve('top'); // по умолчанию
+      }
+    };
+    img.onerror = () => resolve('top');
+    img.src = imgSrc;
+  });
+}
+
 interface TryOnProps { lang?: Lang; }
 
 function lerp(a: number, b: number, t: number) { return a + (b - a) * t; }
@@ -92,6 +190,8 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
   const [manualSize, setManualSize] = useState(55);
   const [manualPosY, setManualPosY] = useState(30);
   const [poseFoundUI, setPoseFoundUI] = useState(false);
+  const [clothType, setClothType] = useState<ClothType>('top');
+  const clothTypeRef = useRef<ClothType>('top');
 
   // Refs — не вызывают ре-рендер, безопасны в RAF
   const poseActiveRef = useRef(false);
@@ -112,6 +212,7 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
   useEffect(() => { facingModeRef.current = facingMode; }, [facingMode]);
   useEffect(() => { manualSizeRef.current = manualSize; }, [manualSize]);
   useEffect(() => { manualPosYRef.current = manualPosY; }, [manualPosY]);
+  useEffect(() => { clothTypeRef.current = clothType; }, [clothType]);
 
   // Подсказки
   useEffect(() => {
@@ -189,27 +290,76 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
           setPoseFoundUI(false);
           return;
         }
-        const ls = lm[11]; const rs = lm[12];
-        const lh = lm[23]; const rh = lm[24];
-        if ((ls.visibility ?? 0) < 0.3 || (rs.visibility ?? 0) < 0.3) {
+        const ls = lm[LM.LEFT_SHOULDER];  const rs = lm[LM.RIGHT_SHOULDER];
+        const lh = lm[LM.LEFT_HIP];       const rh = lm[LM.RIGHT_HIP];
+        const lk = lm[LM.LEFT_KNEE];      const rk = lm[LM.RIGHT_KNEE];
+        const la = lm[LM.LEFT_ANKLE];     const ra = lm[LM.RIGHT_ANKLE];
+        const nose = lm[LM.NOSE];
+
+        if ((ls.visibility ?? 0) < 0.25 || (rs.visibility ?? 0) < 0.25) {
           poseActiveRef.current = false;
           poseResultRef.current = null;
           setPoseFoundUI(false);
           return;
         }
+
         const shoulderW = Math.abs(ls.x - rs.x);
-        // Одежда шире плеч — перекрываем весь торс
-        const clothW = Math.max(shoulderW * 2.2, 0.45);
-        // Центр между плечами (в нормализованных 0-1)
         const centerX = (ls.x + rs.x) / 2;
-        // Верх — чуть выше плеч (воротник)
-        const topY = Math.min(ls.y, rs.y) - 0.08;
-        const hVis = Math.min(lh.visibility ?? 0, rh.visibility ?? 0);
-        // Высота — от плеч до бёдер + запас
-        const bottomY = hVis > 0.25
-          ? (lh.y + rh.y) / 2 + 0.1
-          : topY + clothW * 1.3;
-        const bodyH = bottomY - topY;
+        const cfg = CLOTH_CONFIGS[clothTypeRef.current];
+        const clothW = Math.max(shoulderW * cfg.widthMult, 0.4);
+
+        const hVis  = Math.min(lh.visibility ?? 0, rh.visibility ?? 0);
+        const kVis  = Math.min(lk.visibility ?? 0, rk.visibility ?? 0);
+        const aVis  = Math.min(la.visibility ?? 0, ra.visibility ?? 0);
+        const hipY  = hVis  > 0.2 ? (lh.y + rh.y) / 2   : null;
+        const kneeY = kVis  > 0.2 ? (lk.y + rk.y) / 2   : null;
+        const ankleY = aVis > 0.2 ? (la.y + ra.y) / 2   : null;
+        const shoulderY = (ls.y + rs.y) / 2;
+
+        // Верхний край одежды зависит от типа
+        let topY: number;
+        let bottomY: number;
+
+        switch (clothTypeRef.current) {
+          case 'hat':
+            // Шапка: от верха головы (выше носа) до плеч
+            topY = Math.min(ls.y, rs.y) - shoulderW * 1.2;
+            bottomY = shoulderY;
+            break;
+          case 'top':
+          default:
+            // Куртка/свитер/рубашка: от шеи до бёдер
+            topY = Math.min(ls.y, rs.y) - shoulderW * cfg.topOffset * 3;
+            bottomY = hipY ? hipY + 0.04 : shoulderY + shoulderW * 1.8;
+            break;
+          case 'dress':
+            // Платье: от шеи до колен
+            topY = Math.min(ls.y, rs.y) - shoulderW * cfg.topOffset * 3;
+            bottomY = kneeY ? kneeY + 0.05 : (hipY ? hipY + shoulderW * 1.2 : shoulderY + shoulderW * 2.5);
+            break;
+          case 'bottom':
+            // Брюки/юбка: от бёдер до лодыжек
+            topY = hipY ? hipY - 0.03 : shoulderY + shoulderW * 1.2;
+            bottomY = ankleY ? ankleY + 0.04 : (kneeY ? kneeY + shoulderW * 1.0 : topY + shoulderW * 2.5);
+            break;
+          case 'shoes':
+            // Обувь: у лодыжек
+            topY = ankleY ? ankleY - 0.06 : (kneeY ? kneeY + shoulderW * 0.8 : shoulderY + shoulderW * 2.5);
+            bottomY = topY + shoulderW * 0.6;
+            break;
+          case 'accessory':
+            // Аксессуар: центр груди
+            topY = shoulderY - shoulderW * 0.1;
+            bottomY = hipY ? (hipY + shoulderY) / 2 : shoulderY + shoulderW * 0.8;
+            break;
+        }
+
+        // Для головных уборов/обуви используем координату носа/ступни
+        if (clothTypeRef.current === 'hat' && nose) {
+          topY = nose.y - shoulderW * 0.9;
+        }
+
+        const bodyH = Math.max(bottomY - topY, shoulderW * 0.5);
 
         poseResultRef.current = { x: centerX, y: topY, w: clothW, h: bodyH };
         poseActiveRef.current = true;
@@ -327,6 +477,11 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
         });
         const data = await res.json();
         if (data.ok && data.image) {
+          // Классифицируем одежду по форме PNG
+          const detectedType = await classifyClothing(data.image);
+          setClothType(detectedType);
+          clothTypeRef.current = detectedType;
+
           const img = new Image();
           img.onload = () => { clothImgRef.current = img; };
           img.src = data.image;
@@ -334,6 +489,7 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
           setStep('tryon');
           setCameraStatus('idle');
           smooth.current.ready = false;
+          poseResultRef.current = null;
         } else {
           setBgError(t.errBg);
           setStep('upload');
@@ -571,9 +727,51 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
               style={{ background: 'linear-gradient(to top, rgba(8,11,20,0.5), transparent)' }} />
           </div>
 
+          {/* Тип одежды — показываем что определили, можно скорректировать */}
+          {step === 'tryon' && (
+            <div className="mx-5 mt-3 flex-shrink-0">
+              <div className="glass rounded-2xl p-2.5 flex items-center gap-2 flex-wrap">
+                <span className="text-xs text-white/30 mr-1">
+                  {lang === 'ru' ? 'Тип:' : 'Type:'}
+                </span>
+                {(['top', 'dress', 'bottom', 'shoes', 'hat'] as ClothType[]).map(type => {
+                  const labels: Record<ClothType, string> = {
+                    top: lang === 'ru' ? '🧥 Верх' : '🧥 Top',
+                    dress: lang === 'ru' ? '👗 Платье' : '👗 Dress',
+                    bottom: lang === 'ru' ? '👖 Низ' : '👖 Bottom',
+                    shoes: lang === 'ru' ? '👟 Обувь' : '👟 Shoes',
+                    hat: lang === 'ru' ? '🧢 Шапка' : '🧢 Hat',
+                    accessory: lang === 'ru' ? '💍 Аксессуар' : '💍 Accessory',
+                  };
+                  const isActive = clothType === type;
+                  return (
+                    <button key={type} onClick={() => {
+                      setClothType(type);
+                      clothTypeRef.current = type;
+                      poseResultRef.current = null;
+                      smooth.current.ready = false;
+                    }}
+                      className="text-xs px-2.5 py-1 rounded-xl font-montserrat font-600 transition-all duration-200"
+                      style={isActive ? {
+                        background: 'linear-gradient(135deg, rgba(168,85,247,0.4), rgba(6,182,212,0.3))',
+                        border: '1px solid rgba(168,85,247,0.6)',
+                        color: '#c084fc',
+                      } : {
+                        background: 'rgba(255,255,255,0.05)',
+                        border: '1px solid rgba(255,255,255,0.08)',
+                        color: 'rgba(255,255,255,0.35)',
+                      }}>
+                      {labels[type]}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           {/* Ручные регуляторы */}
           {cameraStatus === 'active' && (
-            <div className="mx-5 mt-3 glass rounded-2xl p-3 space-y-2 flex-shrink-0">
+            <div className="mx-5 mt-2 glass rounded-2xl p-3 space-y-2 flex-shrink-0">
               <p className="text-xs text-white/30 text-center">
                 {poseFoundUI ? (lang === 'ru' ? 'Нейросеть управляет · коррекция вручную' : 'AI tracking · manual correction') : t.manualMode}
               </p>
