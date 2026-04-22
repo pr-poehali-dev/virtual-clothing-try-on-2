@@ -6,7 +6,9 @@ import boto3
 import uuid
 
 CORS = {'Access-Control-Allow-Origin': '*'}
-FAL_TRYON_URL = 'https://fal.run/fal-ai/idm-vton'
+
+# Бесплатный публичный HuggingFace Space OOTDiffusion
+HF_SPACE = 'https://levihsu-ootdiffusion.hf.space'
 
 
 def s3_client():
@@ -26,14 +28,49 @@ def upload_base64_to_s3(data_url: str, folder: str) -> str:
     file_key = f'{folder}/{uuid.uuid4()}.{ext}'
     s3 = s3_client()
     s3.put_object(Bucket='files', Key=file_key, Body=img_bytes, ContentType=f'image/{ext}')
-    cdn_url = f"https://cdn.poehali.dev/projects/{os.environ['AWS_ACCESS_KEY_ID']}/bucket/{file_key}"
-    return cdn_url
+    return f"https://cdn.poehali.dev/projects/{os.environ['AWS_ACCESS_KEY_ID']}/bucket/{file_key}"
+
+
+def upload_to_space(cdn_url: str) -> str:
+    """Загружает изображение с CDN в HF Space и возвращает путь."""
+    img_bytes = requests.get(cdn_url, timeout=20).content
+    resp = requests.post(
+        f'{HF_SPACE}/upload',
+        files={'files': ('image.jpg', img_bytes, 'image/jpeg')},
+        timeout=30,
+    )
+    result = resp.json()
+    if isinstance(result, list) and result:
+        return result[0]
+    return str(result)
+
+
+def extract_image_url(data_item) -> str:
+    """Извлекает URL из ответа Gradio (gallery item)."""
+    if isinstance(data_item, list) and data_item:
+        data_item = data_item[0]
+    if isinstance(data_item, dict):
+        path = data_item.get('image', {})
+        if isinstance(path, dict):
+            path = path.get('path') or path.get('url') or ''
+        elif isinstance(path, str):
+            pass
+        else:
+            path = data_item.get('path') or data_item.get('url') or data_item.get('name') or ''
+        if path.startswith('http'):
+            return path
+        return f'{HF_SPACE}/file={path}'
+    if isinstance(data_item, str):
+        if data_item.startswith('http'):
+            return data_item
+        return f'{HF_SPACE}/file={data_item}'
+    return ''
 
 
 def handler(event: dict, context) -> dict:
     """
-    Виртуальная примерка одежды через fal.ai IDM-VTON.
-    Загружает фото в S3, вызывает fal.ai, возвращает результат.
+    Виртуальная примерка одежды через бесплатный HuggingFace Space OOTDiffusion.
+    Принимает base64 фото человека и одежды, возвращает URL результата.
     """
     if event.get('httpMethod') == 'OPTIONS':
         return {
@@ -47,74 +84,120 @@ def handler(event: dict, context) -> dict:
             'body': '',
         }
 
-    fal_key = os.environ.get('FAL_API_KEY', '')
-    if not fal_key:
-        return {'statusCode': 500, 'headers': CORS, 'body': json.dumps({'error': 'FAL_API_KEY не настроен'})}
-
-    fal_headers = {
-        'Authorization': f'Key {fal_key}',
-        'Content-Type': 'application/json',
-    }
-
     body = json.loads(event.get('body') or '{}')
     action = body.get('action', 'run')
 
     # ── Запуск примерки ──────────────────────────────────────────────────────
     if action == 'run':
-        model_image_b64 = body.get('model_image')
-        garment_image_b64 = body.get('garment_image')
+        model_b64 = body.get('model_image')
+        garment_b64 = body.get('garment_image')
         category = body.get('category', 'tops')
 
-        if not model_image_b64 or not garment_image_b64:
+        if not model_b64 or not garment_b64:
             return {'statusCode': 400, 'headers': CORS,
                     'body': json.dumps({'error': 'Нужны model_image и garment_image'})}
 
-        # Загружаем оба фото в S3 — получаем публичные URL
-        human_url = upload_base64_to_s3(model_image_b64, 'tryon-uploads/human')
-        garm_url = upload_base64_to_s3(garment_image_b64, 'tryon-uploads/garment')
+        # 1. Загружаем оба фото в S3
+        human_cdn = upload_base64_to_s3(model_b64, 'tryon-uploads/human')
+        garm_cdn = upload_base64_to_s3(garment_b64, 'tryon-uploads/garment')
 
-        desc_map = {
-            'tops': 'shirt or top clothing garment',
-            'bottoms': 'pants or skirt clothing garment',
-            'one-pieces': 'dress clothing garment',
+        # 2. Загружаем файлы в HF Space
+        human_path = upload_to_space(human_cdn)
+        garm_path = upload_to_space(garm_cdn)
+
+        # 3. Маппинг категорий для /process_dc
+        cat_map = {
+            'tops': 'Upper-body',
+            'bottoms': 'Lower-body',
+            'one-pieces': 'Dress',
         }
-        garment_desc = desc_map.get(category, 'clothing garment')
+        hf_category = cat_map.get(category, 'Upper-body')
 
-        payload = {
-            'human_image_url': human_url,
-            'garment_image_url': garm_url,
-            'garment_description': garment_desc,
+        # 4. Вызываем API через очередь Gradio
+        session_hash = uuid.uuid4().hex[:8]
+
+        join_payload = {
+            'data': [
+                human_path,   # vton_img
+                garm_path,    # garm_img
+                hf_category,  # category
+                1,            # n_samples
+                20,           # n_steps
+                2.0,          # image_scale
+                -1,           # seed (случайный)
+            ],
+            'fn_index': 1,  # /process_dc
+            'session_hash': session_hash,
         }
 
-        resp = requests.post(
-            FAL_TRYON_URL,
-            headers=fal_headers,
-            json=payload,
-            timeout=120,
+        join_resp = requests.post(
+            f'{HF_SPACE}/queue/join',
+            json=join_payload,
+            timeout=30,
         )
 
-        data = resp.json()
+        if join_resp.status_code != 200:
+            return {
+                'statusCode': 500,
+                'headers': CORS,
+                'body': json.dumps({'error': f'Space недоступен: {join_resp.text[:200]}'}),
+            }
 
-        if resp.status_code != 200:
-            err = data.get('detail') or data.get('error') or str(data)
-            return {'statusCode': 500, 'headers': CORS, 'body': json.dumps({'error': f'fal.ai: {err}'})}
-
-        # fal.ai возвращает результат сразу (синхронно)
-        # Структура: {"image": {"url": "...", "width": ..., "height": ...}}
-        image = data.get('image') or {}
-        result_url = image.get('url') or ''
-
-        if not result_url:
-            # Альтернативная структура
-            result_url = data.get('output', {}).get('image', {}).get('url', '') if isinstance(data.get('output'), dict) else ''
-
-        if not result_url:
-            return {'statusCode': 500, 'headers': CORS, 'body': json.dumps({'error': 'fal.ai не вернул результат', 'raw': str(data)[:300]})}
+        join_data = join_resp.json()
+        event_id = join_data.get('event_id', session_hash)
 
         return {
             'statusCode': 200,
             'headers': CORS,
-            'body': json.dumps({'status': 'completed', 'result_url': result_url}),
+            'body': json.dumps({
+                'id': event_id,
+                'session_hash': session_hash,
+                'status': 'processing',
+            }),
+        }
+
+    # ── Проверка статуса ─────────────────────────────────────────────────────
+    elif action == 'status':
+        session_hash = body.get('session_hash') or body.get('id')
+        if not session_hash:
+            return {'statusCode': 400, 'headers': CORS, 'body': json.dumps({'error': 'Нужен session_hash'})}
+
+        data_resp = requests.get(
+            f'{HF_SPACE}/queue/data',
+            params={'session_hash': session_hash},
+            timeout=20,
+            headers={'Accept': 'text/event-stream'},
+        )
+
+        text = data_resp.text
+        result_url = None
+        status = 'processing'
+        error = None
+
+        for line in text.split('\n'):
+            line = line.strip()
+            if not line.startswith('data:'):
+                continue
+            try:
+                evt = json.loads(line[5:].strip())
+                msg = evt.get('msg', '')
+                if msg == 'process_completed':
+                    output = evt.get('output', {}).get('data', [])
+                    if output:
+                        result_url = extract_image_url(output[0])
+                    status = 'completed'
+                    break
+                elif msg == 'process_errored':
+                    error = str(evt.get('output', {}).get('error', 'Ошибка генерации'))
+                    status = 'failed'
+                    break
+            except Exception:
+                pass
+
+        return {
+            'statusCode': 200,
+            'headers': CORS,
+            'body': json.dumps({'status': status, 'result_url': result_url, 'error': error}),
         }
 
     # ── Сохранение в S3 ──────────────────────────────────────────────────────
@@ -123,10 +206,10 @@ def handler(event: dict, context) -> dict:
         if not image_url:
             return {'statusCode': 400, 'headers': CORS, 'body': json.dumps({'error': 'Нужен image_url'})}
 
-        img_resp = requests.get(image_url, timeout=30)
+        img_bytes = requests.get(image_url, timeout=30).content
         s3 = s3_client()
         file_key = f'tryon-results/{uuid.uuid4()}.png'
-        s3.put_object(Bucket='files', Key=file_key, Body=img_resp.content, ContentType='image/png')
+        s3.put_object(Bucket='files', Key=file_key, Body=img_bytes, ContentType='image/png')
         cdn_url = f"https://cdn.poehali.dev/projects/{os.environ['AWS_ACCESS_KEY_ID']}/bucket/{file_key}"
         return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({'saved_url': cdn_url})}
 

@@ -96,7 +96,6 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
     }, 800);
 
     try {
-      // fal.ai работает синхронно — результат приходит сразу
       const resp = await fetch(TRYON_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -109,22 +108,52 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
       });
       const data = await resp.json();
 
-      clearInterval(prog);
-
       if (!resp.ok || data.error) {
+        clearInterval(prog);
         throw new Error(data.error || 'Ошибка запуска примерки');
       }
 
+      // Если уже готово (синхронный ответ)
       if (data.status === 'completed' && data.result_url) {
+        clearInterval(prog);
         setProgress(100);
         setTimeout(() => {
           setResultUrl(data.result_url);
           setStep('result');
           setRotate3d({ x: 0, y: 0 });
         }, 400);
-      } else {
-        throw new Error('Не удалось получить результат. Попробуй снова.');
+        return;
       }
+
+      // Асинхронный режим — polling
+      const sessionHash = data.session_hash || data.id;
+
+      pollRef.current = setInterval(async () => {
+        try {
+          const statusResp = await fetch(TRYON_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'status', id: data.id, session_hash: sessionHash }),
+          });
+          const statusData = await statusResp.json();
+
+          if (statusData.status === 'completed' && statusData.result_url) {
+            clearInterval(pollRef.current!);
+            clearInterval(prog);
+            setProgress(100);
+            setTimeout(() => {
+              setResultUrl(statusData.result_url);
+              setStep('result');
+              setRotate3d({ x: 0, y: 0 });
+            }, 400);
+          } else if (statusData.status === 'failed' || statusData.error) {
+            clearInterval(pollRef.current!);
+            clearInterval(prog);
+            setError(statusData.error || 'Генерация не удалась. Попробуй другое фото.');
+            setStep('upload_person');
+          }
+        } catch { /* продолжаем polling */ }
+      }, 3000);
 
     } catch (e: unknown) {
       clearInterval(prog);
