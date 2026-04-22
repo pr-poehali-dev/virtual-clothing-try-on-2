@@ -5,11 +5,10 @@ import requests
 import boto3
 import uuid
 
-
 CORS = {'Access-Control-Allow-Origin': '*'}
 
-# Replicate IDM-VTON model version
-REPLICATE_VERSION = 'c871bb9b046607b680449ecbae55fd8c6d945e0a1948644bf2361b3d021d3ff4'
+# Бесплатный публичный HuggingFace Space с IDM-VTON
+HF_SPACE_URL = 'https://yisol-idm-vton.hf.space'
 
 
 def s3_client():
@@ -23,33 +22,45 @@ def s3_client():
 
 def upload_base64_to_s3(data_url: str, folder: str) -> str:
     """Загружает base64 изображение в S3, возвращает публичный CDN URL."""
-    # data_url = "data:image/jpeg;base64,/9j/..."
     header, b64data = data_url.split(',', 1)
-    ext = 'jpg'
-    if 'png' in header:
-        ext = 'png'
-    elif 'webp' in header:
-        ext = 'webp'
-
+    ext = 'png' if 'png' in header else 'jpg'
     img_bytes = base64.b64decode(b64data)
     file_key = f'{folder}/{uuid.uuid4()}.{ext}'
-
     s3 = s3_client()
-    s3.put_object(
-        Bucket='files',
-        Key=file_key,
-        Body=img_bytes,
-        ContentType=f'image/{ext}',
-    )
-
+    s3.put_object(Bucket='files', Key=file_key, Body=img_bytes, ContentType=f'image/{ext}')
     cdn_url = f"https://cdn.poehali.dev/projects/{os.environ['AWS_ACCESS_KEY_ID']}/bucket/{file_key}"
     return cdn_url
 
 
+def upload_url_to_space(image_url: str) -> str:
+    """Загружает изображение по URL в HF Space, возвращает путь файла."""
+    img_resp = requests.get(image_url, timeout=20)
+    files = {'files': ('image.jpg', img_resp.content, 'image/jpeg')}
+    upload_resp = requests.post(f'{HF_SPACE_URL}/upload', files=files, timeout=30)
+    upload_data = upload_resp.json()
+    if isinstance(upload_data, list):
+        return upload_data[0]
+    return upload_data
+
+
+def get_result_url(result_file) -> str:
+    """Извлекает URL из результата Gradio."""
+    if isinstance(result_file, dict):
+        path = result_file.get('path') or result_file.get('url') or result_file.get('name', '')
+        if path.startswith('http'):
+            return path
+        return f'{HF_SPACE_URL}/file={path}'
+    if isinstance(result_file, str):
+        if result_file.startswith('http'):
+            return result_file
+        return f'{HF_SPACE_URL}/file={result_file}'
+    return ''
+
+
 def handler(event: dict, context) -> dict:
     """
-    Виртуальная примерка одежды через Replicate IDM-VTON.
-    Загружает фото в S3, запускает модель, возвращает URL результата.
+    Виртуальная примерка одежды через бесплатный HuggingFace Space IDM-VTON.
+    Загружает фото в S3, вызывает Gradio API, возвращает результат.
     """
     if event.get('httpMethod') == 'OPTIONS':
         return {
@@ -63,128 +74,132 @@ def handler(event: dict, context) -> dict:
             'body': '',
         }
 
-    api_key = os.environ.get('REPLICATE_API_KEY', '')
-    if not api_key:
-        return {'statusCode': 500, 'headers': CORS, 'body': json.dumps({'error': 'REPLICATE_API_KEY не настроен'})}
-
-    rep_headers = {
-        'Authorization': f'Bearer {api_key}',
-        'Content-Type': 'application/json',
-    }
-
     body = json.loads(event.get('body') or '{}')
     action = body.get('action', 'run')
 
-    # Запуск задачи примерки
+    # ── Запуск примерки ──────────────────────────────────────────────────────
     if action == 'run':
         model_image_b64 = body.get('model_image')
         garment_image_b64 = body.get('garment_image')
         category = body.get('category', 'tops')
 
         if not model_image_b64 or not garment_image_b64:
-            return {'statusCode': 400, 'headers': CORS, 'body': json.dumps({'error': 'Нужны model_image и garment_image'})}
+            return {'statusCode': 400, 'headers': CORS,
+                    'body': json.dumps({'error': 'Нужны model_image и garment_image'})}
 
-        # Загружаем оба фото в S3 и получаем публичные URL
-        human_url = upload_base64_to_s3(model_image_b64, 'tryon-uploads/human')
-        garm_url = upload_base64_to_s3(garment_image_b64, 'tryon-uploads/garment')
+        # Загружаем оба фото в S3
+        human_cdn = upload_base64_to_s3(model_image_b64, 'tryon-uploads/human')
+        garm_cdn = upload_base64_to_s3(garment_image_b64, 'tryon-uploads/garment')
 
-        # Маппинг категорий
-        cat_map = {'tops': 'upper_body', 'bottoms': 'lower_body', 'one-pieces': 'dresses'}
-        desc_map = {'tops': 'a shirt or top garment', 'bottoms': 'pants or skirt', 'one-pieces': 'a dress'}
-        rep_category = cat_map.get(category, 'upper_body')
-        garment_desc = desc_map.get(category, 'a clothing item')
+        # Загружаем файлы в HF Space
+        human_path = upload_url_to_space(human_cdn)
+        garm_path = upload_url_to_space(garm_cdn)
 
-        payload = {
-            'version': REPLICATE_VERSION,
-            'input': {
-                'human_img': human_url,
-                'garm_img': garm_url,
-                'garment_des': garment_desc,
-                'category': rep_category,
-                'is_checked': True,
-                'is_checked_crop': False,
-                'denoise_steps': 30,
-                'seed': 42,
-            },
+        desc_map = {
+            'tops': 'shirt or top clothing garment',
+            'bottoms': 'pants or skirt clothing garment',
+            'one-pieces': 'dress clothing garment',
+        }
+        garment_desc = desc_map.get(category, 'clothing garment')
+
+        session_hash = uuid.uuid4().hex[:8]
+
+        # Gradio queue/join
+        join_payload = {
+            'data': [
+                {'background': human_path, 'layers': [], 'composite': None},
+                garm_path,
+                garment_desc,
+                True,   # is_checked
+                False,  # is_checked_crop
+                30,     # denoise_steps
+                42,     # seed
+            ],
+            'fn_index': 0,
+            'session_hash': session_hash,
         }
 
-        resp = requests.post(
-            'https://api.replicate.com/v1/predictions',
-            headers=rep_headers,
-            json=payload,
+        join_resp = requests.post(
+            f'{HF_SPACE_URL}/queue/join',
+            json=join_payload,
             timeout=30,
         )
 
-        data = resp.json()
-
-        if resp.status_code not in (200, 201):
-            err_detail = data.get('detail', '') or str(data)
+        if join_resp.status_code != 200:
             return {
                 'statusCode': 500,
                 'headers': CORS,
-                'body': json.dumps({'error': f'Replicate: {err_detail}'}),
+                'body': json.dumps({'error': f'Space недоступен ({join_resp.status_code}): {join_resp.text[:300]}'}),
             }
 
-        prediction_id = data.get('id')
-        status = data.get('status', 'starting')
-        output = data.get('output')
-
-        if status == 'succeeded' and output:
-            result_url = output[0] if isinstance(output, list) else output
-            return {
-                'statusCode': 200,
-                'headers': CORS,
-                'body': json.dumps({'id': prediction_id, 'status': 'completed', 'result_url': result_url}),
-            }
+        join_data = join_resp.json()
+        event_id = join_data.get('event_id', session_hash)
 
         return {
             'statusCode': 200,
             'headers': CORS,
-            'body': json.dumps({'id': prediction_id, 'status': 'processing'}),
+            'body': json.dumps({
+                'id': event_id,
+                'session_hash': session_hash,
+                'status': 'processing',
+            }),
         }
 
-    # Проверка статуса задачи
+    # ── Проверка статуса ─────────────────────────────────────────────────────
     elif action == 'status':
-        prediction_id = body.get('id')
-        if not prediction_id:
-            return {'statusCode': 400, 'headers': CORS, 'body': json.dumps({'error': 'Нужен id'})}
+        session_hash = body.get('session_hash') or body.get('id')
+        if not session_hash:
+            return {'statusCode': 400, 'headers': CORS, 'body': json.dumps({'error': 'Нужен session_hash'})}
 
-        resp = requests.get(
-            f'https://api.replicate.com/v1/predictions/{prediction_id}',
-            headers=rep_headers,
-            timeout=15,
+        # Читаем SSE поток от Gradio (не stream — просто GET с таймаутом)
+        data_resp = requests.get(
+            f'{HF_SPACE_URL}/queue/data',
+            params={'session_hash': session_hash},
+            timeout=20,
+            headers={'Accept': 'text/event-stream'},
         )
 
-        data = resp.json()
-        status = data.get('status')
-        output = data.get('output')
-        error = data.get('error')
-
+        text = data_resp.text
         result_url = None
-        if status == 'succeeded' and output:
-            result_url = output[0] if isinstance(output, list) else output
+        status = 'processing'
+        error = None
 
-        mapped = 'completed' if status == 'succeeded' else ('failed' if status == 'failed' else 'processing')
+        for line in text.split('\n'):
+            line = line.strip()
+            if not line.startswith('data:'):
+                continue
+            try:
+                evt = json.loads(line[5:].strip())
+                msg = evt.get('msg', '')
+                if msg == 'process_completed':
+                    output_data = evt.get('output', {}).get('data', [])
+                    if output_data:
+                        result_url = get_result_url(output_data[0])
+                    status = 'completed'
+                    break
+                elif msg == 'process_errored':
+                    error = evt.get('output', {}).get('error', 'Ошибка генерации')
+                    status = 'failed'
+                    break
+            except Exception:
+                pass
 
         return {
             'statusCode': 200,
             'headers': CORS,
-            'body': json.dumps({'status': mapped, 'result_url': result_url, 'error': error}),
+            'body': json.dumps({'status': status, 'result_url': result_url, 'error': error}),
         }
 
-    # Сохранение результата в S3
+    # ── Сохранение в S3 ──────────────────────────────────────────────────────
     elif action == 'save':
         image_url = body.get('image_url')
         if not image_url:
             return {'statusCode': 400, 'headers': CORS, 'body': json.dumps({'error': 'Нужен image_url'})}
 
         img_resp = requests.get(image_url, timeout=30)
-        img_bytes = img_resp.content
-
         s3 = s3_client()
         file_key = f'tryon-results/{uuid.uuid4()}.png'
-        s3.put_object(Bucket='files', Key=file_key, Body=img_bytes, ContentType='image/png')
-
+        s3.put_object(Bucket='files', Key=file_key, Body=img_resp.content, ContentType='image/png')
         cdn_url = f"https://cdn.poehali.dev/projects/{os.environ['AWS_ACCESS_KEY_ID']}/bucket/{file_key}"
         return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({'saved_url': cdn_url})}
 

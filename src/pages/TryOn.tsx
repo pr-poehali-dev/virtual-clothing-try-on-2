@@ -113,12 +113,13 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
       }
 
       const predId = data.id;
+      const sessionHash = data.session_hash || predId;
 
       pollRef.current = setInterval(async () => {
         const statusResp = await fetch(TRYON_URL, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: 'status', id: predId }),
+          body: JSON.stringify({ action: 'status', id: predId, session_hash: sessionHash }),
         });
         const statusData = await statusResp.json();
 
