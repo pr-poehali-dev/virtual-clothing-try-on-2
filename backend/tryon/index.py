@@ -114,14 +114,24 @@ def run_tryon(human_path: str, garm_path: str, hf_category: str, hf_token: str) 
             try:
                 evt = json.loads(raw_line[5:].strip())
                 msg = evt.get('msg', '')
+                print(f'[SSE] msg={msg}')
+
                 if msg == 'process_completed':
-                    output = evt.get('output', {}).get('data', [])
-                    if not output:
-                        raise Exception('Нейросеть вернула пустой результат')
-                    return extract_image_url(output[0])
+                    out = evt.get('output', {})
+                    print(f'[SSE] output={json.dumps(out)[:600]}')
+                    data_arr = out.get('data', []) if isinstance(out, dict) else (out if isinstance(out, list) else [])
+                    if not data_arr:
+                        raise Exception(f'Пустой output от нейросети: {json.dumps(out)[:200]}')
+                    return extract_image_url(data_arr[0])
+
                 elif msg == 'process_errored':
-                    err = evt.get('output', {}).get('error', 'Ошибка генерации')
-                    raise Exception(str(err))
+                    out = evt.get('output', {})
+                    err = out.get('error', str(out)) if isinstance(out, dict) else str(out)
+                    raise Exception(f'Space error: {err}')
+
+                elif msg == 'queue_full':
+                    raise Exception('Очередь HuggingFace Space переполнена, попробуй через минуту')
+
             except json.JSONDecodeError:
                 pass
 
