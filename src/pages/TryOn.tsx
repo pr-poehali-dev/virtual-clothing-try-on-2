@@ -92,8 +92,8 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
     setProgress(5);
 
     const prog = setInterval(() => {
-      setProgress(p => p < 85 ? p + Math.random() * 3 : p);
-    }, 800);
+      setProgress(p => p < 90 ? p + Math.random() * 2.5 : p);
+    }, 1000);
 
     try {
       const resp = await fetch(TRYON_URL, {
@@ -108,14 +108,13 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
       });
       const data = await resp.json();
 
+      clearInterval(prog);
+
       if (!resp.ok || data.error) {
-        clearInterval(prog);
-        throw new Error(data.error || 'Ошибка запуска примерки');
+        throw new Error(data.error || 'Ошибка примерки');
       }
 
-      // Синхронный результат
       if (data.status === 'completed' && data.result_url) {
-        clearInterval(prog);
         setProgress(100);
         setTimeout(() => {
           setResultUrl(data.result_url);
@@ -125,43 +124,7 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
         return;
       }
 
-      // Асинхронный — polling каждые 4 сек
-      const sessionHash = data.session_hash || data.id;
-      let attempts = 0;
-
-      pollRef.current = setInterval(async () => {
-        attempts++;
-        if (attempts > 30) {
-          clearInterval(pollRef.current!);
-          clearInterval(prog);
-          setError('Превышено время ожидания. Попробуй снова.');
-          setStep('upload_person');
-          return;
-        }
-        try {
-          const sr = await fetch(TRYON_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ action: 'status', id: data.id, session_hash: sessionHash }),
-          });
-          const sd = await sr.json();
-          if (sd.status === 'completed' && sd.result_url) {
-            clearInterval(pollRef.current!);
-            clearInterval(prog);
-            setProgress(100);
-            setTimeout(() => {
-              setResultUrl(sd.result_url);
-              setStep('result');
-              setRotate3d({ x: 0, y: 0 });
-            }, 300);
-          } else if (sd.status === 'failed' || sd.error) {
-            clearInterval(pollRef.current!);
-            clearInterval(prog);
-            setError(sd.error || 'Генерация не удалась. Попробуй другое фото.');
-            setStep('upload_person');
-          }
-        } catch { /* продолжаем */ }
-      }, 4000);
+      throw new Error('Нейросеть не вернула результат. Попробуй снова.');
 
     } catch (e: unknown) {
       clearInterval(prog);

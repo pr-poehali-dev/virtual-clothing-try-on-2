@@ -7,11 +7,11 @@
       "expectedStatus": 200
     },
     {
-      "name": "Run without token",
+      "name": "Run without images",
       "method": "POST",
       "path": "/",
       "body": {"action": "run"},
-      "expectedStatus": 500,
+      "expectedStatus": 400,
       "bodyMatcher": "partial"
     }
   ]
