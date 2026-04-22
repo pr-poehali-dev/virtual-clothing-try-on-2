@@ -198,13 +198,18 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
           return;
         }
         const shoulderW = Math.abs(ls.x - rs.x);
-        const topY = Math.min(ls.y, rs.y) - 0.05;
-        const clothW = shoulderW * 1.6;
-        const centerX = (ls.x + rs.x) / 2 - clothW / 2;
+        // Одежда шире плеч — перекрываем весь торс
+        const clothW = Math.max(shoulderW * 2.2, 0.45);
+        // Центр между плечами (в нормализованных 0-1)
+        const centerX = (ls.x + rs.x) / 2;
+        // Верх — чуть выше плеч (воротник)
+        const topY = Math.min(ls.y, rs.y) - 0.08;
         const hVis = Math.min(lh.visibility ?? 0, rh.visibility ?? 0);
-        const bodyH = hVis > 0.25
-          ? Math.abs(((lh.y + rh.y) / 2) - topY) + 0.08
-          : shoulderW * 1.5;
+        // Высота — от плеч до бёдер + запас
+        const bottomY = hVis > 0.25
+          ? (lh.y + rh.y) / 2 + 0.1
+          : topY + clothW * 1.3;
+        const bodyH = bottomY - topY;
 
         poseResultRef.current = { x: centerX, y: topY, w: clothW, h: bodyH };
         poseActiveRef.current = true;
@@ -254,21 +259,27 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
       let tx: number, ty: number, tw: number;
 
       const pr = poseResultRef.current;
+      const isMirrored = facingModeRef.current === 'user';
+
       if (pr && poseActiveRef.current) {
         const s = smooth.current;
-        const speed = s.ready ? 0.14 : 0.7;
+        const speed = s.ready ? 0.14 : 0.75;
         s.cx = lerp(s.cx, pr.x, speed);
         s.cy = lerp(s.cy, pr.y, speed);
         s.cw = lerp(s.cw, pr.w, speed);
         s.ch = lerp(s.ch, pr.h, speed);
         s.ready = true;
 
-        // canvas зеркалится через CSS transform — поэтому X не инвертируем
         tw = s.cw * vw;
-        tx = s.cx * vw;
         ty = s.cy * vh;
+
+        // MediaPipe даёт координаты как в оригинальном (незеркальном) видео.
+        // Canvas НЕ зеркалится через CSS — рисуем сами с учётом зеркала.
+        // centerX = s.cx (центр в 0-1). При зеркале: x_mirrored = 1 - centerX
+        const centerXpx = isMirrored ? (1 - s.cx) * vw : s.cx * vw;
+        tx = centerXpx - tw / 2;
       } else {
-        tw = vw * (0.3 + manualSizeRef.current * 0.005);
+        tw = vw * (0.45 + manualSizeRef.current * 0.004);
         tx = (vw - tw) / 2;
         ty = vh * (manualPosYRef.current / 100);
       }
@@ -357,15 +368,13 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     const mirrored = facingModeRef.current === 'user';
+    // Рисуем видео (зеркалим для фронтальной камеры)
     if (mirrored) { ctx.translate(w, 0); ctx.scale(-1, 1); }
     ctx.drawImage(video, 0, 0, w, h);
-    if (mirrored) { ctx.translate(w, 0); ctx.scale(-1, 1); } // reset
     ctx.setTransform(1, 0, 0, 1, 0, 0);
-    // overlay canvas тоже зеркалится через CSS — рисуем его зеркально
+    // Overlay canvas уже содержит одежду с правильными координатами — просто накладываем
     if (overlay) {
-      if (mirrored) { ctx.translate(w, 0); ctx.scale(-1, 1); }
       ctx.drawImage(overlay, 0, 0, w, h);
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
     }
     setPhotoStatus('flash');
     setTimeout(() => setPhotoStatus('done'), 180);
@@ -476,10 +485,10 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
               className="absolute inset-0 w-full h-full object-cover"
               style={{ transform: facingMode === 'user' ? 'scaleX(-1)' : 'none', display: cameraStatus === 'active' ? 'block' : 'none' }}
             />
-            {/* Overlay canvas — зеркалится вместе с видео */}
+            {/* Overlay canvas — НЕ зеркалим через CSS, X-координаты считаем вручную */}
             <canvas ref={overlayCanvasRef}
               className="absolute inset-0 w-full h-full"
-              style={{ transform: facingMode === 'user' ? 'scaleX(-1)' : 'none', display: cameraStatus === 'active' ? 'block' : 'none', pointerEvents: 'none' }}
+              style={{ display: cameraStatus === 'active' ? 'block' : 'none', pointerEvents: 'none' }}
             />
 
             {/* Фон */}
