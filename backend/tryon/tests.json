@@ -7,11 +7,11 @@
       "expectedStatus": 200
     },
     {
-      "name": "Run without images - no key",
+      "name": "Status check without id",
       "method": "POST",
       "path": "/",
-      "body": {"action": "run"},
-      "expectedStatus": 500,
+      "body": {"action": "status"},
+      "expectedStatus": 400,
       "bodyMatcher": "partial"
     }
   ]
