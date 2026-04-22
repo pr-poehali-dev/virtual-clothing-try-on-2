@@ -75,6 +75,10 @@ export default function TryOn() {
     startCamera(next);
   };
 
+  const sizeLabel = size < 33 ? 'XS' : size < 50 ? 'S' : size < 67 ? 'M' : size < 84 ? 'L' : 'XL';
+  const emojiScale = 0.8 + size * 0.008;
+  const emojiTop = 30 + (posY - 50) * 0.5;
+
   const handleSave = () => {
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
@@ -127,11 +131,6 @@ export default function TryOn() {
       URL.revokeObjectURL(url);
     }, 'image/jpeg', 0.92);
   }, [facingMode, selected, emojiScale, emojiTop]);
-
-  const sizeLabel = size < 33 ? 'XS' : size < 50 ? 'S' : size < 67 ? 'M' : size < 84 ? 'L' : 'XL';
-
-  const emojiScale = 0.8 + size * 0.008;
-  const emojiTop = 30 + (posY - 50) * 0.5;
 
   return (
     <div className="flex flex-col h-full relative">
