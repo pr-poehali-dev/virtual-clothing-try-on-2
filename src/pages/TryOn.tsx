@@ -1,6 +1,8 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import Icon from '@/components/ui/icon';
 
+type PhotoStatus = 'idle' | 'flash' | 'done';
+
 const CLOTHES = [
   { id: 1, name: 'Бомбер', emoji: '🧥', color: '#a855f7', category: 'Верх' },
   { id: 2, name: 'Худи', emoji: '👕', color: '#06b6d4', category: 'Верх' },
@@ -20,9 +22,11 @@ export default function TryOn() {
   const [cameraStatus, setCameraStatus] = useState<CameraStatus>('idle');
   const [scanning, setScanning] = useState(false);
   const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user');
+  const [photoStatus, setPhotoStatus] = useState<PhotoStatus>('idle');
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
 
   const stopCamera = useCallback(() => {
     if (streamRef.current) {
@@ -76,6 +80,54 @@ export default function TryOn() {
     setTimeout(() => setSaved(false), 2000);
   };
 
+  const handlePhoto = useCallback(() => {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!video || !canvas) return;
+
+    const w = video.videoWidth || 640;
+    const h = video.videoHeight || 480;
+    canvas.width = w;
+    canvas.height = h;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    // Зеркалим для фронтальной камеры
+    if (facingMode === 'user') {
+      ctx.translate(w, 0);
+      ctx.scale(-1, 1);
+    }
+    ctx.drawImage(video, 0, 0, w, h);
+    if (facingMode === 'user') {
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+    }
+
+    // Рисуем эмодзи одежды поверх
+    const fontSize = Math.round((80 * emojiScale) * (w / 390));
+    ctx.font = `${fontSize}px serif`;
+    ctx.textAlign = 'center';
+    const emojiX = w / 2;
+    const emojiY = (emojiTop / 100) * h + fontSize * 0.8;
+    ctx.fillText(selected.emoji, emojiX, emojiY);
+
+    // Вспышка
+    setPhotoStatus('flash');
+    setTimeout(() => setPhotoStatus('done'), 200);
+    setTimeout(() => setPhotoStatus('idle'), 2500);
+
+    // Скачиваем
+    canvas.toBlob(blob => {
+      if (!blob) return;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `fitar-${selected.name}-${Date.now()}.jpg`;
+      a.click();
+      URL.revokeObjectURL(url);
+    }, 'image/jpeg', 0.92);
+  }, [facingMode, selected, emojiScale, emojiTop]);
+
   const sizeLabel = size < 33 ? 'XS' : size < 50 ? 'S' : size < 67 ? 'M' : size < 84 ? 'L' : 'XL';
 
   const emojiScale = 0.8 + size * 0.008;
@@ -100,6 +152,9 @@ export default function TryOn() {
           )}
         </button>
       </div>
+
+      {/* Скрытый canvas для съёмки */}
+      <canvas ref={canvasRef} className="hidden" />
 
       {/* AR Вьюпорт */}
       <div className="mx-5 relative rounded-3xl overflow-hidden" style={{ height: '340px' }}>
@@ -237,6 +292,12 @@ export default function TryOn() {
           </button>
         )}
 
+        {/* Вспышка при съёмке */}
+        {photoStatus === 'flash' && (
+          <div className="absolute inset-0 z-50 pointer-events-none"
+            style={{ background: 'rgba(255,255,255,0.85)', transition: 'opacity 0.15s' }} />
+        )}
+
         {/* Градиент снизу */}
         <div className="absolute bottom-0 left-0 right-0 h-16 pointer-events-none z-10"
           style={{ background: 'linear-gradient(to top, rgba(8,11,20,0.7), transparent)' }} />
@@ -296,20 +357,46 @@ export default function TryOn() {
       {/* Кнопки действий */}
       {cameraStatus === 'active' && (
         <div className="px-5 mt-4 flex gap-3 animate-slide-in-bottom">
+          {/* Кнопка фото — главная */}
+          <button
+            onClick={handlePhoto}
+            className="flex-shrink-0 w-14 h-14 rounded-2xl flex items-center justify-center transition-all duration-200 active:scale-90"
+            style={{
+              background: photoStatus === 'done'
+                ? 'rgba(34,197,94,0.2)'
+                : 'linear-gradient(135deg, #06b6d4, #6366f1)',
+              boxShadow: photoStatus !== 'done' ? '0 0 20px rgba(6,182,212,0.5)' : '0 0 20px rgba(34,197,94,0.4)',
+              border: '2px solid rgba(255,255,255,0.15)',
+            }}>
+            <Icon
+              name={photoStatus === 'done' ? 'Check' : 'Camera'}
+              size={22}
+              className="text-white"
+            />
+          </button>
+
+          {/* Лайк */}
           <button onClick={handleSave}
             className={`flex-1 py-3 rounded-2xl font-montserrat font-700 text-sm flex items-center justify-center gap-2 transition-all duration-300 ${
-              saved
-                ? 'border text-green-400'
-                : 'btn-primary'
+              saved ? 'border text-green-400' : 'btn-primary'
             }`}
             style={saved ? { background: 'rgba(34,197,94,0.15)', borderColor: 'rgba(34,197,94,0.4)' } : {}}>
             <Icon name={saved ? 'Check' : 'Heart'} size={16} />
             {saved ? 'Сохранено!' : 'Сохранить'}
           </button>
-          <button className="btn-secondary px-4 py-3 rounded-2xl flex items-center justify-center">
+
+          {/* Поделиться */}
+          <button className="btn-secondary w-12 h-14 rounded-2xl flex items-center justify-center flex-shrink-0">
             <Icon name="Share2" size={18} className="text-white/70" />
           </button>
         </div>
+      )}
+
+      {/* Подпись под кнопкой фото */}
+      {photoStatus === 'done' && (
+        <p className="text-center text-xs text-cyan-400 mt-2 animate-fade-in-up">
+          Фото сохранено на устройство ✓
+        </p>
       )}
     </div>
   );
