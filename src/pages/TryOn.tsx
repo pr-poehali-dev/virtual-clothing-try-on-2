@@ -92,8 +92,8 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
     setProgress(5);
 
     const prog = setInterval(() => {
-      setProgress(p => p < 85 ? p + Math.random() * 4 : p);
-    }, 800);
+      setProgress(p => p < 90 ? p + Math.random() * 8 : p);
+    }, 400);
 
     try {
       const resp = await fetch(TRYON_URL, {
@@ -108,52 +108,23 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
       });
       const data = await resp.json();
 
+      clearInterval(prog);
+
       if (!resp.ok || data.error) {
-        clearInterval(prog);
-        throw new Error(data.error || 'Ошибка запуска примерки');
+        throw new Error(data.error || 'Ошибка примерки');
       }
 
-      // Если уже готово (синхронный ответ)
       if (data.status === 'completed' && data.result_url) {
-        clearInterval(prog);
         setProgress(100);
         setTimeout(() => {
           setResultUrl(data.result_url);
           setStep('result');
           setRotate3d({ x: 0, y: 0 });
-        }, 400);
+        }, 300);
         return;
       }
 
-      // Асинхронный режим — polling
-      const sessionHash = data.session_hash || data.id;
-
-      pollRef.current = setInterval(async () => {
-        try {
-          const statusResp = await fetch(TRYON_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ action: 'status', id: data.id, session_hash: sessionHash }),
-          });
-          const statusData = await statusResp.json();
-
-          if (statusData.status === 'completed' && statusData.result_url) {
-            clearInterval(pollRef.current!);
-            clearInterval(prog);
-            setProgress(100);
-            setTimeout(() => {
-              setResultUrl(statusData.result_url);
-              setStep('result');
-              setRotate3d({ x: 0, y: 0 });
-            }, 400);
-          } else if (statusData.status === 'failed' || statusData.error) {
-            clearInterval(pollRef.current!);
-            clearInterval(prog);
-            setError(statusData.error || 'Генерация не удалась. Попробуй другое фото.');
-            setStep('upload_person');
-          }
-        } catch { /* продолжаем polling */ }
-      }, 3000);
+      throw new Error('Не удалось получить результат');
 
     } catch (e: unknown) {
       clearInterval(prog);
@@ -475,8 +446,8 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
           </div>
 
           <div style={{ textAlign: 'center' }}>
-            <h2 style={{ margin: 0, fontSize: 20, fontWeight: 700, color: '#fff' }}>ИИ примеряет одежду</h2>
-            <p style={{ margin: '8px 0 0', fontSize: 13, color: 'rgba(255,255,255,0.4)' }}>Нейросеть анализирует фото...<br />Обычно занимает 15–30 секунд</p>
+            <h2 style={{ margin: 0, fontSize: 20, fontWeight: 700, color: '#fff' }}>Примеряем одежду</h2>
+            <p style={{ margin: '8px 0 0', fontSize: 13, color: 'rgba(255,255,255,0.4)' }}>Вырезаем одежду и накладываем на фото...<br />Займёт около 5 секунд</p>
           </div>
 
           <div style={{ width: '100%', maxWidth: 280 }}>

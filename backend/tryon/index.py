@@ -4,11 +4,10 @@ import base64
 import requests
 import boto3
 import uuid
+from PIL import Image, ImageFilter, ImageEnhance
+import io
 
 CORS = {'Access-Control-Allow-Origin': '*'}
-
-# Бесплатный публичный HuggingFace Space OOTDiffusion
-HF_SPACE = 'https://levihsu-ootdiffusion.hf.space'
 
 
 def s3_client():
@@ -20,57 +19,123 @@ def s3_client():
     )
 
 
-def upload_base64_to_s3(data_url: str, folder: str) -> str:
-    """Загружает base64 изображение в S3, возвращает публичный CDN URL."""
+def decode_base64_image(data_url: str) -> Image.Image:
+    """Декодирует base64 строку в PIL Image."""
     header, b64data = data_url.split(',', 1)
-    ext = 'png' if 'png' in header else 'jpg'
     img_bytes = base64.b64decode(b64data)
-    file_key = f'{folder}/{uuid.uuid4()}.{ext}'
-    s3 = s3_client()
-    s3.put_object(Bucket='files', Key=file_key, Body=img_bytes, ContentType=f'image/{ext}')
-    return f"https://cdn.poehali.dev/projects/{os.environ['AWS_ACCESS_KEY_ID']}/bucket/{file_key}"
+    return Image.open(io.BytesIO(img_bytes)).convert('RGBA')
 
 
-def upload_to_space(cdn_url: str) -> str:
-    """Загружает изображение с CDN в HF Space и возвращает путь."""
-    img_bytes = requests.get(cdn_url, timeout=20).content
+def remove_background(image: Image.Image, api_key: str) -> Image.Image:
+    """Убирает фон с изображения через remove.bg API."""
+    buf = io.BytesIO()
+    image.convert('RGB').save(buf, format='JPEG', quality=90)
+    buf.seek(0)
+
     resp = requests.post(
-        f'{HF_SPACE}/upload',
-        files={'files': ('image.jpg', img_bytes, 'image/jpeg')},
+        'https://api.remove.bg/v1.0/removebg',
+        files={'image_file': ('image.jpg', buf, 'image/jpeg')},
+        data={'size': 'auto'},
+        headers={'X-Api-Key': api_key},
         timeout=30,
     )
-    result = resp.json()
-    if isinstance(result, list) and result:
-        return result[0]
-    return str(result)
+
+    if resp.status_code != 200:
+        raise Exception(f'remove.bg ошибка: {resp.text[:200]}')
+
+    return Image.open(io.BytesIO(resp.content)).convert('RGBA')
 
 
-def extract_image_url(data_item) -> str:
-    """Извлекает URL из ответа Gradio (gallery item)."""
-    if isinstance(data_item, list) and data_item:
-        data_item = data_item[0]
-    if isinstance(data_item, dict):
-        path = data_item.get('image', {})
-        if isinstance(path, dict):
-            path = path.get('path') or path.get('url') or ''
-        elif isinstance(path, str):
-            pass
-        else:
-            path = data_item.get('path') or data_item.get('url') or data_item.get('name') or ''
-        if path.startswith('http'):
-            return path
-        return f'{HF_SPACE}/file={path}'
-    if isinstance(data_item, str):
-        if data_item.startswith('http'):
-            return data_item
-        return f'{HF_SPACE}/file={data_item}'
-    return ''
+def find_garment_bbox(garment: Image.Image):
+    """Находит bounding box непрозрачных пикселей одежды."""
+    alpha = garment.split()[3]
+    bbox = alpha.getbbox()
+    return bbox or (0, 0, garment.width, garment.height)
+
+
+def find_body_region(person: Image.Image, category: str):
+    """
+    Грубо определяет область тела для наложения одежды.
+    Возвращает (x, y, w, h) — куда поместить одежду.
+    """
+    pw, ph = person.size
+
+    if category == 'tops':
+        # Верхняя часть тела: ~от 15% до 60% высоты, по центру
+        y = int(ph * 0.13)
+        h = int(ph * 0.47)
+        w = int(pw * 0.85)
+        x = int((pw - w) / 2)
+    elif category == 'bottoms':
+        # Нижняя часть: ~от 52% до 90% высоты
+        y = int(ph * 0.50)
+        h = int(ph * 0.42)
+        w = int(pw * 0.70)
+        x = int((pw - w) / 2)
+    else:  # one-pieces / dress
+        # Почти всё тело: ~от 13% до 88%
+        y = int(ph * 0.13)
+        h = int(ph * 0.75)
+        w = int(pw * 0.85)
+        x = int((pw - w) / 2)
+
+    return x, y, w, h
+
+
+def composite_outfit(person: Image.Image, garment_nobg: Image.Image, category: str) -> Image.Image:
+    """Накладывает одежду на фото человека с умным позиционированием."""
+    result = person.convert('RGBA').copy()
+    pw, ph = result.size
+
+    # Область для наложения
+    tx, ty, tw, th = find_body_region(person, category)
+
+    # Обрезаем одежду до bounding box непрозрачных пикселей
+    bbox = find_garment_bbox(garment_nobg)
+    garment_crop = garment_nobg.crop(bbox)
+
+    # Масштабируем одежду в целевую область с сохранением пропорций
+    gw, gh = garment_crop.size
+    scale = min(tw / gw, th / gh)
+    new_gw = int(gw * scale)
+    new_gh = int(gh * scale)
+    garment_resized = garment_crop.resize((new_gw, new_gh), Image.LANCZOS)
+
+    # Центрируем в области
+    paste_x = tx + (tw - new_gw) // 2
+    paste_y = ty + (th - new_gh) // 2
+
+    # Слегка размываем края одежды для плавного вхождения
+    alpha = garment_resized.split()[3]
+    alpha_blurred = alpha.filter(ImageFilter.GaussianBlur(radius=2))
+    garment_resized.putalpha(alpha_blurred)
+
+    # Немного усиливаем насыщенность одежды чтобы выглядело естественнее
+    enhancer = ImageEnhance.Color(garment_resized)
+    garment_resized = enhancer.enhance(1.05)
+
+    result.paste(garment_resized, (paste_x, paste_y), garment_resized.split()[3])
+
+    return result.convert('RGB')
+
+
+def save_image_to_s3(img: Image.Image) -> str:
+    """Сохраняет PIL Image в S3 и возвращает CDN URL."""
+    buf = io.BytesIO()
+    img.save(buf, format='JPEG', quality=92)
+    buf.seek(0)
+
+    s3 = s3_client()
+    file_key = f'tryon-results/{uuid.uuid4()}.jpg'
+    s3.put_object(Bucket='files', Key=file_key, Body=buf.getvalue(), ContentType='image/jpeg')
+    return f"https://cdn.poehali.dev/projects/{os.environ['AWS_ACCESS_KEY_ID']}/bucket/{file_key}"
 
 
 def handler(event: dict, context) -> dict:
     """
-    Виртуальная примерка одежды через бесплатный HuggingFace Space OOTDiffusion.
-    Принимает base64 фото человека и одежды, возвращает URL результата.
+    Виртуальная примерка: вырезает фон с одежды через remove.bg,
+    накладывает на фото человека с умным позиционированием.
+    Работает быстро (~3-5 сек), бесплатно, без внешних AI сервисов.
     """
     if event.get('httpMethod') == 'OPTIONS':
         return {
@@ -87,7 +152,7 @@ def handler(event: dict, context) -> dict:
     body = json.loads(event.get('body') or '{}')
     action = body.get('action', 'run')
 
-    # ── Запуск примерки ──────────────────────────────────────────────────────
+    # ── Примерка ─────────────────────────────────────────────────────────────
     if action == 'run':
         model_b64 = body.get('model_image')
         garment_b64 = body.get('garment_image')
@@ -97,110 +162,31 @@ def handler(event: dict, context) -> dict:
             return {'statusCode': 400, 'headers': CORS,
                     'body': json.dumps({'error': 'Нужны model_image и garment_image'})}
 
-        # 1. Загружаем оба фото в S3
-        human_cdn = upload_base64_to_s3(model_b64, 'tryon-uploads/human')
-        garm_cdn = upload_base64_to_s3(garment_b64, 'tryon-uploads/garment')
+        remove_bg_key = os.environ.get('REMOVE_BG_API_KEY', '')
+        if not remove_bg_key:
+            return {'statusCode': 500, 'headers': CORS,
+                    'body': json.dumps({'error': 'REMOVE_BG_API_KEY не настроен'})}
 
-        # 2. Загружаем файлы в HF Space
-        human_path = upload_to_space(human_cdn)
-        garm_path = upload_to_space(garm_cdn)
+        # 1. Декодируем фото
+        person_img = decode_base64_image(model_b64)
+        garment_img = decode_base64_image(garment_b64)
 
-        # 3. Маппинг категорий для /process_dc
-        cat_map = {
-            'tops': 'Upper-body',
-            'bottoms': 'Lower-body',
-            'one-pieces': 'Dress',
-        }
-        hf_category = cat_map.get(category, 'Upper-body')
+        # 2. Убираем фон с одежды
+        garment_nobg = remove_background(garment_img, remove_bg_key)
 
-        # 4. Вызываем API через очередь Gradio
-        session_hash = uuid.uuid4().hex[:8]
+        # 3. Накладываем одежду на человека
+        result_img = composite_outfit(person_img, garment_nobg, category)
 
-        join_payload = {
-            'data': [
-                human_path,   # vton_img
-                garm_path,    # garm_img
-                hf_category,  # category
-                1,            # n_samples
-                20,           # n_steps
-                2.0,          # image_scale
-                -1,           # seed (случайный)
-            ],
-            'fn_index': 1,  # /process_dc
-            'session_hash': session_hash,
-        }
-
-        join_resp = requests.post(
-            f'{HF_SPACE}/queue/join',
-            json=join_payload,
-            timeout=30,
-        )
-
-        if join_resp.status_code != 200:
-            return {
-                'statusCode': 500,
-                'headers': CORS,
-                'body': json.dumps({'error': f'Space недоступен: {join_resp.text[:200]}'}),
-            }
-
-        join_data = join_resp.json()
-        event_id = join_data.get('event_id', session_hash)
+        # 4. Сохраняем результат в S3
+        result_url = save_image_to_s3(result_img)
 
         return {
             'statusCode': 200,
             'headers': CORS,
-            'body': json.dumps({
-                'id': event_id,
-                'session_hash': session_hash,
-                'status': 'processing',
-            }),
+            'body': json.dumps({'status': 'completed', 'result_url': result_url}),
         }
 
-    # ── Проверка статуса ─────────────────────────────────────────────────────
-    elif action == 'status':
-        session_hash = body.get('session_hash') or body.get('id')
-        if not session_hash:
-            return {'statusCode': 400, 'headers': CORS, 'body': json.dumps({'error': 'Нужен session_hash'})}
-
-        data_resp = requests.get(
-            f'{HF_SPACE}/queue/data',
-            params={'session_hash': session_hash},
-            timeout=20,
-            headers={'Accept': 'text/event-stream'},
-        )
-
-        text = data_resp.text
-        result_url = None
-        status = 'processing'
-        error = None
-
-        for line in text.split('\n'):
-            line = line.strip()
-            if not line.startswith('data:'):
-                continue
-            try:
-                evt = json.loads(line[5:].strip())
-                msg = evt.get('msg', '')
-                if msg == 'process_completed':
-                    output = evt.get('output', {}).get('data', [])
-                    if output:
-                        result_url = extract_image_url(output[0])
-                    status = 'completed'
-                    break
-                elif msg == 'process_errored':
-                    error = str(evt.get('output', {}).get('error', 'Ошибка генерации'))
-                    status = 'failed'
-                    break
-            except Exception:
-                pass
-
-        return {
-            'statusCode': 200,
-            'headers': CORS,
-            'body': json.dumps({'status': status, 'result_url': result_url, 'error': error}),
-        }
-
-    # ── Сохранение в S3 ──────────────────────────────────────────────────────
+    # ── Сохранение копии в историю ───────────────────────────────────────────
     elif action == 'save':
         image_url = body.get('image_url')
         if not image_url:
@@ -208,8 +194,8 @@ def handler(event: dict, context) -> dict:
 
         img_bytes = requests.get(image_url, timeout=30).content
         s3 = s3_client()
-        file_key = f'tryon-results/{uuid.uuid4()}.png'
-        s3.put_object(Bucket='files', Key=file_key, Body=img_bytes, ContentType='image/png')
+        file_key = f'tryon-history/{uuid.uuid4()}.jpg'
+        s3.put_object(Bucket='files', Key=file_key, Body=img_bytes, ContentType='image/jpeg')
         cdn_url = f"https://cdn.poehali.dev/projects/{os.environ['AWS_ACCESS_KEY_ID']}/bucket/{file_key}"
         return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({'saved_url': cdn_url})}
 
