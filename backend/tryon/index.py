@@ -12,6 +12,8 @@ CORS = {
     'Access-Control-Allow-Headers': 'Content-Type, X-User-Id, X-Auth-Token, X-Session-Id',
 }
 
+SPACE_URL = 'https://levihsu-ootdiffusion.hf.space'
+
 
 def s3_client():
     return boto3.client(
@@ -35,81 +37,100 @@ def dataurl_to_bytes(data_url: str) -> tuple:
     return base64.b64decode(b64data), ext
 
 
+def upload_to_space(img_bytes: bytes, ext: str, hf_token: str) -> str:
+    headers = {'Authorization': f'Bearer {hf_token}'}
+    resp = requests.post(
+        f'{SPACE_URL}/upload',
+        headers=headers,
+        files={'files': (f'image.{ext}', img_bytes, f'image/{ext}')},
+        timeout=60,
+    )
+    print(f'[VTON] upload status={resp.status_code} body={resp.text[:200]}')
+    if resp.status_code != 200:
+        raise Exception(f'Upload to Space failed ({resp.status_code}): {resp.text[:200]}')
+    return resp.json()[0]
+
+
 def run_vton(model_b64: str, garment_b64: str, category: str, hf_token: str) -> str:
     """
-    Виртуальная примерка через HuggingFace Inference API.
-    Модель: fashn/tryon — бесплатная, специализированная для одежды.
+    Виртуальная примерка через OOTDiffusion HuggingFace Space (бесплатно).
+    Endpoint /process_dc поддерживает верх/низ/платья.
     """
     cat_map = {
-        'tops': 'upper_body',
-        'bottoms': 'lower_body',
-        'dresses': 'dresses',
-        'one-pieces': 'dresses',
-        'upper_body': 'upper_body',
-        'lower_body': 'lower_body',
+        'tops': 'Upper-body',
+        'upper_body': 'Upper-body',
+        'bottoms': 'Lower-body',
+        'lower_body': 'Lower-body',
+        'dresses': 'Dress',
+        'one-pieces': 'Dress',
     }
-    vton_category = cat_map.get(category, 'upper_body')
+    vton_category = cat_map.get(category, 'Upper-body')
 
-    model_bytes, _ = dataurl_to_bytes(model_b64)
-    garment_bytes, _ = dataurl_to_bytes(garment_b64)
+    model_bytes, model_ext = dataurl_to_bytes(model_b64)
+    garment_bytes, garment_ext = dataurl_to_bytes(garment_b64)
+
+    print(f'[VTON] OOTDiffusion category={vton_category} model={len(model_bytes)}b garment={len(garment_bytes)}b')
 
     headers = {'Authorization': f'Bearer {hf_token}'}
 
-    print(f'[VTON] Uploading to fashn/tryon, category={vton_category}')
-    print(f'[VTON] model_size={len(model_bytes)} garment_size={len(garment_bytes)}')
+    # Загружаем оба изображения в Space
+    model_path = upload_to_space(model_bytes, model_ext, hf_token)
+    garment_path = upload_to_space(garment_bytes, garment_ext, hf_token)
 
+    # Вызываем /process_dc
     payload = {
-        'inputs': {
-            'model_image': base64.b64encode(model_bytes).decode(),
-            'garment_image': base64.b64encode(garment_bytes).decode(),
-            'category': vton_category,
-        }
+        'data': [
+            {'path': model_path, 'orig_name': f'model.{model_ext}'},
+            {'path': garment_path, 'orig_name': f'garment.{garment_ext}'},
+            1,          # n_samples
+            20,         # n_steps
+            2.0,        # image_scale
+            42,         # seed
+            vton_category,
+        ]
     }
 
-    resp = requests.post(
-        'https://api-inference.huggingface.co/models/fashn/tryon',
-        headers=headers,
-        json=payload,
+    predict_resp = requests.post(
+        f'{SPACE_URL}/api/predict',
+        headers={**headers, 'Content-Type': 'application/json'},
+        json={'fn_index': 1, **payload},
         timeout=120,
     )
+    print(f'[VTON] predict status={predict_resp.status_code} body={predict_resp.text[:300]}')
 
-    print(f'[VTON] fashn/tryon status={resp.status_code} len={len(resp.content)}')
+    if predict_resp.status_code != 200:
+        raise Exception(f'OOTDiffusion ошибка ({predict_resp.status_code}): {predict_resp.text[:300]}')
 
-    if resp.status_code == 503:
-        data = resp.json()
-        wait = data.get('estimated_time', 20)
-        print(f'[VTON] Model loading, waiting {wait}s')
-        time.sleep(min(float(wait), 40))
-        resp = requests.post(
-            'https://api-inference.huggingface.co/models/fashn/tryon',
-            headers=headers,
-            json=payload,
-            timeout=120,
-        )
-        print(f'[VTON] Retry status={resp.status_code}')
+    result = predict_resp.json()
+    output_data = result.get('data', [])
 
-    if resp.status_code == 200:
-        # Ответ — бинарное изображение
-        if resp.content[:3] in (b'\xff\xd8\xff', b'\x89PN'):
-            return upload_image_to_s3(resp.content, 'tryon-results', 'jpg')
-        # Или JSON с URL
-        try:
-            data = resp.json()
-            url = data.get('output') or data.get('result') or data.get('url')
-            if url:
-                img_bytes = requests.get(url, timeout=30).content
-                return upload_image_to_s3(img_bytes, 'tryon-results', 'jpg')
-        except Exception:
-            pass
-        if len(resp.content) > 1000:
-            return upload_image_to_s3(resp.content, 'tryon-results', 'jpg')
+    if not output_data:
+        raise Exception('OOTDiffusion не вернул результат')
 
-    raise Exception(f'HuggingFace ошибка ({resp.status_code}): {resp.text[:300]}')
+    # Первый элемент — галерея изображений
+    gallery = output_data[0]
+    if isinstance(gallery, list) and len(gallery) > 0:
+        first = gallery[0]
+        result_url = first.get('url') or first.get('path') or first
+    elif isinstance(gallery, dict):
+        result_url = gallery.get('url') or gallery.get('path')
+    else:
+        result_url = str(gallery)
+
+    if not result_url:
+        raise Exception('Не удалось получить URL результата')
+
+    if not result_url.startswith('http'):
+        result_url = f'{SPACE_URL}/file={result_url}'
+
+    print(f'[VTON] result_url={result_url}')
+    img_bytes = requests.get(result_url, headers=headers, timeout=30).content
+    return upload_image_to_s3(img_bytes, 'tryon-results', 'jpg')
 
 
 def handler(event: dict, context) -> dict:
     """
-    Виртуальная примерка одежды через HuggingFace (бесплатно).
+    Виртуальная примерка одежды через OOTDiffusion (бесплатно).
     Сохраняет лицо, фигуру и позу человека — меняет только одежду.
     """
     if event.get('httpMethod') == 'OPTIONS':
@@ -129,7 +150,7 @@ def handler(event: dict, context) -> dict:
     if action == 'run':
         model_data = body.get('model_image')
         garment_data = body.get('garment_image')
-        category = body.get('category', 'upper_body')
+        category = body.get('category', 'tops')
 
         if not model_data or not garment_data:
             return {
