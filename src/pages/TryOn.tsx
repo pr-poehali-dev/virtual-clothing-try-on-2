@@ -31,7 +31,7 @@ function compressAndBase64(file: File, maxSize = 1024): Promise<string> {
       canvas.height = height;
       const ctx = canvas.getContext('2d')!;
       ctx.drawImage(img, 0, 0, width, height);
-      resolve(canvas.toDataURL('image/jpeg', 0.85));
+      resolve(canvas.toDataURL('image/jpeg', 0.7));
     };
     img.onerror = reject;
     img.src = url;
@@ -65,7 +65,7 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
     setPersonPreview(url);
     setError(null);
     try {
-      const b64 = await compressAndBase64(file, 1024);
+      const b64 = await compressAndBase64(file, 512);
       setPersonBase64(b64);
       setTimeout(() => setStep('upload_garment'), 400);
     } catch {
@@ -78,7 +78,7 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
     setGarmentPreview(url);
     setError(null);
     try {
-      const b64 = await compressAndBase64(file, 1024);
+      const b64 = await compressAndBase64(file, 512);
       setGarmentBase64(b64);
     } catch {
       setError('Не удалось загрузить фото одежды. Попробуй другое.');
