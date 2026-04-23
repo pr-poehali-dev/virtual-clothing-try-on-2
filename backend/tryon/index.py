@@ -78,15 +78,30 @@ def action_start(body: dict, hf_token: str) -> dict:
 
     session_hash = uuid.uuid4().hex
 
-    join_payload = {
-        'fn_index': 0,  # process_hd
-        'data': [
-            {'path': model_path, 'orig_name': f'model.{model_ext}'},
-            {'path': garment_path, 'orig_name': f'garment.{garment_ext}'},
-            1, 20, 2.0, 42,
-        ],
-        'session_hash': session_hash,
-    }
+    # fn_index=2 — process_hd (верх тела)
+    # fn_index=8 — process_dc (верх/низ/платье с категорией)
+    use_dc = vton_category in ('Lower-body', 'Dress')
+    if use_dc:
+        join_payload = {
+            'fn_index': 8,
+            'data': [
+                {'path': model_path, 'orig_name': f'model.{model_ext}'},
+                {'path': garment_path, 'orig_name': f'garment.{garment_ext}'},
+                vton_category,
+                1, 20, 2.0, 42,
+            ],
+            'session_hash': session_hash,
+        }
+    else:
+        join_payload = {
+            'fn_index': 2,
+            'data': [
+                {'path': model_path, 'orig_name': f'model.{model_ext}'},
+                {'path': garment_path, 'orig_name': f'garment.{garment_ext}'},
+                1, 20, 2.0, 42,
+            ],
+            'session_hash': session_hash,
+        }
 
     headers = {'Authorization': f'Bearer {hf_token}', 'Content-Type': 'application/json'}
     join_resp = requests.post(f'{SPACE_URL}/queue/join', headers=headers, json=join_payload, timeout=15)
