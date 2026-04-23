@@ -43,18 +43,19 @@ def upload_to_space(img_bytes: bytes, ext: str, hf_token: str) -> str:
         f'{SPACE_URL}/upload',
         headers=headers,
         files={'files': (f'image.{ext}', img_bytes, f'image/{ext}')},
-        timeout=60,
+        timeout=30,
     )
     print(f'[VTON] upload status={resp.status_code} body={resp.text[:200]}')
     if resp.status_code != 200:
-        raise Exception(f'Upload to Space failed ({resp.status_code}): {resp.text[:200]}')
-    return resp.json()[0]
+        raise Exception(f'Upload failed ({resp.status_code}): {resp.text[:200]}')
+    paths = resp.json()
+    return paths[0] if isinstance(paths, list) else paths
 
 
 def run_vton(model_b64: str, garment_b64: str, category: str, hf_token: str) -> str:
     """
     Виртуальная примерка через OOTDiffusion HuggingFace Space (бесплатно).
-    Endpoint /process_dc поддерживает верх/низ/платья.
+    Использует Gradio queue API для надёжной работы с длинными задачами.
     """
     cat_map = {
         'tops': 'Upper-body',
@@ -69,63 +70,108 @@ def run_vton(model_b64: str, garment_b64: str, category: str, hf_token: str) -> 
     model_bytes, model_ext = dataurl_to_bytes(model_b64)
     garment_bytes, garment_ext = dataurl_to_bytes(garment_b64)
 
-    print(f'[VTON] OOTDiffusion category={vton_category} model={len(model_bytes)}b garment={len(garment_bytes)}b')
+    print(f'[VTON] category={vton_category} model={len(model_bytes)}b garment={len(garment_bytes)}b')
 
     headers = {'Authorization': f'Bearer {hf_token}'}
 
-    # Загружаем оба изображения в Space
+    # Загружаем изображения
     model_path = upload_to_space(model_bytes, model_ext, hf_token)
     garment_path = upload_to_space(garment_bytes, garment_ext, hf_token)
+    print(f'[VTON] model_path={model_path} garment_path={garment_path}')
 
-    # Вызываем /process_dc
-    payload = {
+    # Ставим задачу в очередь через Gradio queue/join
+    join_payload = {
+        'fn_index': 1,  # process_dc
         'data': [
             {'path': model_path, 'orig_name': f'model.{model_ext}'},
             {'path': garment_path, 'orig_name': f'garment.{garment_ext}'},
-            1,          # n_samples
-            20,         # n_steps
-            2.0,        # image_scale
-            42,         # seed
+            1,    # n_samples
+            20,   # n_steps
+            2.0,  # image_scale
+            42,   # seed
             vton_category,
-        ]
+        ],
+        'session_hash': uuid.uuid4().hex,
     }
 
-    predict_resp = requests.post(
-        f'{SPACE_URL}/api/predict',
+    join_resp = requests.post(
+        f'{SPACE_URL}/queue/join',
         headers={**headers, 'Content-Type': 'application/json'},
-        json={'fn_index': 1, **payload},
-        timeout=120,
+        json=join_payload,
+        timeout=30,
     )
-    print(f'[VTON] predict status={predict_resp.status_code} body={predict_resp.text[:300]}')
+    print(f'[VTON] queue/join status={join_resp.status_code} body={join_resp.text[:200]}')
 
-    if predict_resp.status_code != 200:
-        raise Exception(f'OOTDiffusion ошибка ({predict_resp.status_code}): {predict_resp.text[:300]}')
+    if join_resp.status_code != 200:
+        raise Exception(f'queue/join failed ({join_resp.status_code}): {join_resp.text[:200]}')
 
-    result = predict_resp.json()
-    output_data = result.get('data', [])
+    event_id = join_resp.json().get('event_id')
+    print(f'[VTON] event_id={event_id}')
 
-    if not output_data:
-        raise Exception('OOTDiffusion не вернул результат')
+    # Поллим результат через queue/data
+    session_hash = join_payload['session_hash']
+    for attempt in range(40):
+        time.sleep(3)
+        data_resp = requests.get(
+            f'{SPACE_URL}/queue/data',
+            headers=headers,
+            params={'session_hash': session_hash},
+            timeout=30,
+            stream=True,
+        )
+        print(f'[VTON] poll attempt={attempt} status={data_resp.status_code}')
 
-    # Первый элемент — галерея изображений
-    gallery = output_data[0]
-    if isinstance(gallery, list) and len(gallery) > 0:
-        first = gallery[0]
-        result_url = first.get('url') or first.get('path') or first
-    elif isinstance(gallery, dict):
-        result_url = gallery.get('url') or gallery.get('path')
-    else:
-        result_url = str(gallery)
+        if data_resp.status_code != 200:
+            continue
 
-    if not result_url:
-        raise Exception('Не удалось получить URL результата')
+        # SSE stream — читаем построчно
+        for raw_line in data_resp.iter_lines():
+            if not raw_line:
+                continue
+            line = raw_line.decode('utf-8') if isinstance(raw_line, bytes) else raw_line
+            if not line.startswith('data:'):
+                continue
+            try:
+                msg = json.loads(line[5:].strip())
+            except Exception:
+                continue
 
-    if not result_url.startswith('http'):
-        result_url = f'{SPACE_URL}/file={result_url}'
+            msg_type = msg.get('msg')
+            print(f'[VTON] SSE msg={msg_type}')
 
-    print(f'[VTON] result_url={result_url}')
-    img_bytes = requests.get(result_url, headers=headers, timeout=30).content
-    return upload_image_to_s3(img_bytes, 'tryon-results', 'jpg')
+            if msg_type == 'process_completed':
+                output = msg.get('output', {})
+                gallery = output.get('data', [[]])[0]
+                print(f'[VTON] gallery={str(gallery)[:200]}')
+
+                if isinstance(gallery, list) and len(gallery) > 0:
+                    first = gallery[0]
+                    if isinstance(first, dict):
+                        result_url = first.get('url') or first.get('path') or ''
+                    else:
+                        result_url = str(first)
+                elif isinstance(gallery, dict):
+                    result_url = gallery.get('url') or gallery.get('path') or ''
+                else:
+                    result_url = str(gallery)
+
+                if not result_url:
+                    raise Exception('Пустой URL результата')
+
+                if not result_url.startswith('http'):
+                    result_url = f'{SPACE_URL}/file={result_url}'
+
+                print(f'[VTON] downloading result from {result_url}')
+                img_resp = requests.get(result_url, headers=headers, timeout=30)
+                return upload_image_to_s3(img_resp.content, 'tryon-results', 'jpg')
+
+            if msg_type == 'process_generating':
+                break  # ещё генерируется, продолжаем поллить
+
+            if msg_type in ('queue_full', 'error'):
+                raise Exception(f'Space вернул ошибку: {msg}')
+
+    raise Exception('Превышено время ожидания ответа от OOTDiffusion')
 
 
 def handler(event: dict, context) -> dict:
