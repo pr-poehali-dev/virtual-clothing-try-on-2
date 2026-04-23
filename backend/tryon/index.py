@@ -80,8 +80,9 @@ def run_vton(model_b64: str, garment_b64: str, category: str, hf_token: str) -> 
     print(f'[VTON] model_path={model_path} garment_path={garment_path}')
 
     # Ставим задачу в очередь через Gradio queue/join
+    # fn_index=0 — process_hd (без категории, более стабильный)
     join_payload = {
-        'fn_index': 1,  # process_dc
+        'fn_index': 0,
         'data': [
             {'path': model_path, 'orig_name': f'model.{model_ext}'},
             {'path': garment_path, 'orig_name': f'garment.{garment_ext}'},
@@ -89,7 +90,6 @@ def run_vton(model_b64: str, garment_b64: str, category: str, hf_token: str) -> 
             20,   # n_steps
             2.0,  # image_scale
             42,   # seed
-            vton_category,
         ],
         'session_hash': uuid.uuid4().hex,
     }
@@ -141,22 +141,31 @@ def run_vton(model_b64: str, garment_b64: str, category: str, hf_token: str) -> 
 
             if msg_type == 'process_completed':
                 output = msg.get('output', {})
-                gallery = output.get('data', [[]])[0]
-                print(f'[VTON] gallery={str(gallery)[:200]}')
+                all_data = output.get('data', [])
+                print(f'[VTON] full output data={str(all_data)[:400]}')
 
-                if isinstance(gallery, list) and len(gallery) > 0:
-                    first = gallery[0]
-                    if isinstance(first, dict):
-                        result_url = first.get('url') or first.get('path') or ''
-                    else:
-                        result_url = str(first)
-                elif isinstance(gallery, dict):
-                    result_url = gallery.get('url') or gallery.get('path') or ''
-                else:
-                    result_url = str(gallery)
+                result_url = ''
+                # Ищем URL изображения в любом месте ответа
+                for item in all_data:
+                    if isinstance(item, list):
+                        for sub in item:
+                            if isinstance(sub, dict):
+                                result_url = sub.get('url') or sub.get('path') or ''
+                            elif isinstance(sub, str) and ('http' in sub or '/tmp/' in sub or '/file=' in sub):
+                                result_url = sub
+                            if result_url:
+                                break
+                    elif isinstance(item, dict):
+                        result_url = item.get('url') or item.get('path') or ''
+                    elif isinstance(item, str) and ('http' in item or '/tmp/' in item):
+                        result_url = item
+                    if result_url:
+                        break
+
+                print(f'[VTON] extracted result_url={result_url}')
 
                 if not result_url:
-                    raise Exception('Пустой URL результата')
+                    raise Exception(f'Пустой результат от Space. data={str(all_data)[:200]}')
 
                 if not result_url.startswith('http'):
                     result_url = f'{SPACE_URL}/file={result_url}'
