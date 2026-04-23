@@ -12,10 +12,9 @@ CORS = {
     'Access-Control-Allow-Headers': 'Content-Type, X-User-Id, X-Auth-Token, X-Session-Id',
 }
 
-REPLICATE_API = 'https://api.replicate.com/v1'
-# IDM-VTON — специализированная модель виртуальной примерки одежды
-# Сохраняет лицо, фигуру и позу человека, меняет только одежду
-VTON_MODEL = 'cuuupid/idm-vton:c871bb9b046607b680449ecbae55fd8c6d945e0a1948644bf2361b3d021d3ff4'
+HF_API = 'https://api-inference.huggingface.co/models'
+# Nymbo Virtual Try-On — стабильная модель на HF Inference API
+VTON_MODEL = 'Nymbo/Virtual-Try-On'
 
 
 def s3_client():
@@ -25,12 +24,6 @@ def s3_client():
         aws_access_key_id=os.environ['AWS_ACCESS_KEY_ID'],
         aws_secret_access_key=os.environ['AWS_SECRET_ACCESS_KEY'],
     )
-
-
-def data_url_to_base64(data_url: str) -> str:
-    if ',' in data_url:
-        return data_url.split(',', 1)[1]
-    return data_url
 
 
 def upload_image_to_s3(img_bytes: bytes, folder: str, ext: str = 'png') -> str:
@@ -47,103 +40,166 @@ def upload_dataurl_to_s3(data_url: str, folder: str) -> str:
     return upload_image_to_s3(img_bytes, folder, ext)
 
 
-def run_vton(model_image_url: str, garment_image_url: str, category: str, api_key: str) -> str:
+def dataurl_to_bytes(data_url: str) -> tuple[bytes, str]:
+    header, b64data = data_url.split(',', 1)
+    ext = 'png' if 'png' in header else 'jpg'
+    return base64.b64decode(b64data), ext
+
+
+def run_vton_hf(model_image_b64: str, garment_image_b64: str, category: str, hf_token: str) -> str:
     """
-    Запускает IDM-VTON через Replicate.
-    Модель сохраняет лицо, телосложение и позу человека,
-    заменяя только одежду на указанную.
-    Возвращает URL готового изображения.
+    Виртуальная примерка через HuggingFace Inference API.
+    Использует модель Nymbo/Virtual-Try-On — бесплатно.
     """
+    model_bytes, _ = dataurl_to_bytes(model_image_b64)
+    garment_bytes, _ = dataurl_to_bytes(garment_image_b64)
+
+    headers = {
+        'Authorization': f'Bearer {hf_token}',
+        'Content-Type': 'application/json',
+    }
+
     cat_map = {
         'tops': 'upper_body',
         'bottoms': 'lower_body',
         'dresses': 'dresses',
+        'one-pieces': 'dresses',
         'upper_body': 'upper_body',
         'lower_body': 'lower_body',
     }
-    garment_desc_map = {
-        'upper_body': 'upper body clothing item',
-        'lower_body': 'lower body clothing item',
-        'dresses': 'dress or full body outfit',
-    }
     vton_category = cat_map.get(category, 'upper_body')
-    garment_desc = garment_desc_map.get(vton_category, 'clothing item')
-
-    headers = {
-        'Authorization': f'Token {api_key}',
-        'Content-Type': 'application/json',
-        'Prefer': 'wait',
-    }
 
     payload = {
-        'version': VTON_MODEL.split(':')[1],
-        'input': {
-            'human_img': model_image_url,
-            'garm_img': garment_image_url,
-            'garment_des': garment_desc,
-            'category': vton_category,
-            'is_checked': True,
-            'is_checked_crop': False,
-            'denoise_steps': 30,
-            'seed': 42,
+        'inputs': {
+            'background': base64.b64encode(model_bytes).decode(),
+            'layers': [base64.b64encode(garment_bytes).decode()],
         },
+        'parameters': {
+            'category': vton_category,
+        }
     }
 
-    print(f'[VTON] Starting IDM-VTON prediction, category={vton_category}')
-    resp = requests.post(
-        f'{REPLICATE_API}/predictions',
-        json=payload,
-        headers=headers,
+    print(f'[VTON-HF] Sending request to {VTON_MODEL}, category={vton_category}')
+
+    # Retry до 5 раз — модель может быть на загрузке
+    for attempt in range(5):
+        resp = requests.post(
+            f'{HF_API}/{VTON_MODEL}',
+            headers=headers,
+            json=payload,
+            timeout=120,
+        )
+        print(f'[VTON-HF] attempt={attempt} status={resp.status_code}')
+
+        if resp.status_code == 503:
+            wait = resp.json().get('estimated_time', 20)
+            print(f'[VTON-HF] Model loading, waiting {wait}s...')
+            time.sleep(min(float(wait), 30))
+            continue
+
+        if resp.status_code == 200:
+            img_bytes = resp.content
+            cdn_url = upload_image_to_s3(img_bytes, 'tryon-results', 'jpg')
+            return cdn_url
+
+        raise Exception(f'HuggingFace API ошибка ({resp.status_code}): {resp.text[:300]}')
+
+    raise Exception('Модель на HuggingFace не отвечает, попробуй чуть позже')
+
+
+def run_vton_gradio(model_image_b64: str, garment_image_b64: str, category: str, hf_token: str) -> str:
+    """
+    Виртуальная примерка через HuggingFace Space (Gradio API).
+    Fallback если Inference API не работает.
+    """
+    SPACE_URL = 'https://nymbo-virtual-try-on.hf.space'
+
+    model_bytes, model_ext = dataurl_to_bytes(model_image_b64)
+    garment_bytes, garment_ext = dataurl_to_bytes(garment_image_b64)
+
+    headers = {'Authorization': f'Bearer {hf_token}'}
+
+    cat_map = {
+        'tops': 'Upper body',
+        'bottoms': 'Lower body',
+        'dresses': 'Dress',
+        'one-pieces': 'Dress',
+        'upper_body': 'Upper body',
+        'lower_body': 'Lower body',
+        'dresses_cat': 'Dress',
+    }
+    vton_category = cat_map.get(category, 'Upper body')
+
+    print(f'[VTON-Gradio] Using Space {SPACE_URL}, category={vton_category}')
+
+    # Загружаем изображения в Space
+    def upload_to_space(img_bytes: bytes, ext: str) -> str:
+        upload_resp = requests.post(
+            f'{SPACE_URL}/upload',
+            headers=headers,
+            files={'files': (f'image.{ext}', img_bytes, f'image/{ext}')},
+            timeout=60,
+        )
+        if upload_resp.status_code != 200:
+            raise Exception(f'Upload failed: {upload_resp.text[:200]}')
+        return upload_resp.json()[0]
+
+    model_path = upload_to_space(model_bytes, model_ext)
+    garment_path = upload_to_space(garment_bytes, garment_ext)
+
+    # Запускаем предсказание через Gradio API
+    predict_payload = {
+        'data': [
+            {'path': model_path},
+            {'path': garment_path},
+            vton_category,
+            True,   # is_checked
+            True,   # is_checked_crop
+            30,     # denoise_steps
+            42,     # seed
+        ]
+    }
+
+    predict_resp = requests.post(
+        f'{SPACE_URL}/api/predict',
+        headers={**headers, 'Content-Type': 'application/json'},
+        json=predict_payload,
         timeout=120,
     )
-    print(f'[VTON] status={resp.status_code} body={resp.text[:500]}')
+    print(f'[VTON-Gradio] predict status={predict_resp.status_code}')
 
-    if resp.status_code not in (200, 201):
-        raise Exception(f'Replicate API ошибка ({resp.status_code}): {resp.text[:300]}')
+    if predict_resp.status_code != 200:
+        raise Exception(f'Gradio predict ошибка ({predict_resp.status_code}): {predict_resp.text[:300]}')
 
-    data = resp.json()
+    result_data = predict_resp.json()
+    output = result_data.get('data', [{}])[0]
+    result_url = output.get('url') or output.get('path', '')
 
-    # Если Prefer: wait не сработал — поллим вручную
-    if data.get('status') not in ('succeeded', 'failed', 'canceled'):
-        prediction_id = data['id']
-        poll_url = f'{REPLICATE_API}/predictions/{prediction_id}'
-        for attempt in range(60):
-            time.sleep(3)
-            poll_resp = requests.get(poll_url, headers=headers, timeout=15)
-            data = poll_resp.json()
-            print(f'[VTON] poll attempt={attempt} status={data.get("status")}')
-            if data.get('status') in ('succeeded', 'failed', 'canceled'):
-                break
+    if not result_url:
+        raise Exception('Gradio не вернул результат')
 
-    if data.get('status') == 'failed':
-        raise Exception(f'IDM-VTON завершился с ошибкой: {data.get("error")}')
+    if not result_url.startswith('http'):
+        result_url = f'{SPACE_URL}/file={result_url}'
 
-    output = data.get('output')
-    if not output:
-        raise Exception('IDM-VTON не вернул результат')
-
-    result_url = output if isinstance(output, str) else output[0]
-
-    # Сохраняем результат в S3
-    img_bytes = requests.get(result_url, timeout=30).content
+    img_bytes = requests.get(result_url, headers=headers, timeout=30).content
     cdn_url = upload_image_to_s3(img_bytes, 'tryon-results', 'jpg')
     return cdn_url
 
 
 def handler(event: dict, context) -> dict:
     """
-    Виртуальная примерка одежды через Replicate IDM-VTON.
+    Виртуальная примерка одежды через HuggingFace (бесплатно).
     Сохраняет лицо, фигуру и позу человека — меняет только одежду.
     """
     if event.get('httpMethod') == 'OPTIONS':
         return {'statusCode': 200, 'headers': CORS, 'body': ''}
 
-    api_key = os.environ.get('REPLICATE_API_KEY', '')
-    if not api_key:
+    hf_token = os.environ.get('HF_TOKEN', '')
+    if not hf_token:
         return {
             'statusCode': 500,
             'headers': {'Access-Control-Allow-Origin': '*'},
-            'body': json.dumps({'error': 'REPLICATE_API_KEY не настроен'}),
+            'body': json.dumps({'error': 'HF_TOKEN не настроен'}),
         }
 
     body = json.loads(event.get('body') or '{}')
@@ -161,11 +217,11 @@ def handler(event: dict, context) -> dict:
                 'body': json.dumps({'error': 'Нужны model_image и garment_image'}),
             }
 
-        # Загружаем оба изображения в S3, чтобы Replicate мог их скачать по URL
-        model_url = upload_dataurl_to_s3(model_data, 'tryon-input')
-        garment_url = upload_dataurl_to_s3(garment_data, 'tryon-input')
-
-        result_url = run_vton(model_url, garment_url, category, api_key)
+        try:
+            result_url = run_vton_gradio(model_data, garment_data, category, hf_token)
+        except Exception as e:
+            print(f'[VTON] Gradio failed: {e}, trying Inference API...')
+            result_url = run_vton_hf(model_data, garment_data, category, hf_token)
 
         return {
             'statusCode': 200,
