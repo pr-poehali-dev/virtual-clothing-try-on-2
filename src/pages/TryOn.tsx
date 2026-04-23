@@ -92,39 +92,57 @@ export default function TryOn({ lang = 'ru' }: TryOnProps) {
     setProgress(5);
 
     const prog = setInterval(() => {
-      setProgress(p => p < 90 ? p + Math.random() * 2.5 : p);
-    }, 1000);
+      setProgress(p => p < 85 ? p + Math.random() * 1.5 : p);
+    }, 1500);
 
     try {
-      const resp = await fetch(TRYON_URL, {
+      // Шаг 1: запускаем задачу, получаем session_hash
+      const startResp = await fetch(TRYON_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          action: 'run',
+          action: 'start',
           model_image: personBase64,
           garment_image: garmentBase64,
           category,
         }),
       });
-      const data = await resp.json();
+      const startData = await startResp.json();
 
-      clearInterval(prog);
-
-      if (!resp.ok || data.error) {
-        throw new Error(data.error || 'Ошибка примерки');
+      if (!startResp.ok || startData.error) {
+        throw new Error(startData.error || 'Ошибка запуска примерки');
       }
 
-      if (data.status === 'completed' && data.result_url) {
-        setProgress(100);
-        setTimeout(() => {
-          setResultUrl(data.result_url);
-          setStep('result');
-          setRotate3d({ x: 0, y: 0 });
-        }, 300);
-        return;
+      const { session_hash } = startData;
+      if (!session_hash) throw new Error('Не получен session_hash');
+
+      // Шаг 2: поллим статус каждые 3 секунды (до 3 минут)
+      for (let attempt = 0; attempt < 60; attempt++) {
+        await new Promise(r => setTimeout(r, 3000));
+
+        const statusResp = await fetch(TRYON_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'status', session_hash }),
+        });
+        const statusData = await statusResp.json();
+
+        if (statusData.error) throw new Error(statusData.error);
+
+        if (statusData.status === 'completed' && statusData.result_url) {
+          clearInterval(prog);
+          setProgress(100);
+          setTimeout(() => {
+            setResultUrl(statusData.result_url);
+            setStep('result');
+            setRotate3d({ x: 0, y: 0 });
+          }, 300);
+          return;
+        }
+        // status === 'processing' — продолжаем ждать
       }
 
-      throw new Error('Нейросеть не вернула результат. Попробуй снова.');
+      throw new Error('Превышено время ожидания. Попробуй снова.');
 
     } catch (e: unknown) {
       clearInterval(prog);

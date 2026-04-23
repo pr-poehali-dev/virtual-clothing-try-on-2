@@ -45,201 +45,175 @@ def upload_to_space(img_bytes: bytes, ext: str, hf_token: str) -> str:
         files={'files': (f'image.{ext}', img_bytes, f'image/{ext}')},
         timeout=30,
     )
-    print(f'[VTON] upload status={resp.status_code} body={resp.text[:200]}')
     if resp.status_code != 200:
         raise Exception(f'Upload failed ({resp.status_code}): {resp.text[:200]}')
     paths = resp.json()
     return paths[0] if isinstance(paths, list) else paths
 
 
-def run_vton(model_b64: str, garment_b64: str, category: str, hf_token: str) -> str:
-    """
-    Виртуальная примерка через OOTDiffusion HuggingFace Space (бесплатно).
-    Использует Gradio queue API для надёжной работы с длинными задачами.
-    """
+def action_start(body: dict, hf_token: str) -> dict:
+    """Загружает фото в Space и ставит задачу в очередь, возвращает session_hash."""
+    model_data = body.get('model_image')
+    garment_data = body.get('garment_image')
+    category = body.get('category', 'tops')
+
+    if not model_data or not garment_data:
+        return {'statusCode': 400, 'body': json.dumps({'error': 'Нужны model_image и garment_image'})}
+
     cat_map = {
-        'tops': 'Upper-body',
-        'upper_body': 'Upper-body',
-        'bottoms': 'Lower-body',
-        'lower_body': 'Lower-body',
-        'dresses': 'Dress',
-        'one-pieces': 'Dress',
+        'tops': 'Upper-body', 'upper_body': 'Upper-body',
+        'bottoms': 'Lower-body', 'lower_body': 'Lower-body',
+        'dresses': 'Dress', 'one-pieces': 'Dress',
     }
     vton_category = cat_map.get(category, 'Upper-body')
 
-    model_bytes, model_ext = dataurl_to_bytes(model_b64)
-    garment_bytes, garment_ext = dataurl_to_bytes(garment_b64)
+    model_bytes, model_ext = dataurl_to_bytes(model_data)
+    garment_bytes, garment_ext = dataurl_to_bytes(garment_data)
 
-    print(f'[VTON] category={vton_category} model={len(model_bytes)}b garment={len(garment_bytes)}b')
+    print(f'[VTON] start category={vton_category} model={len(model_bytes)}b garment={len(garment_bytes)}b')
 
-    headers = {'Authorization': f'Bearer {hf_token}'}
-
-    # Загружаем изображения
     model_path = upload_to_space(model_bytes, model_ext, hf_token)
     garment_path = upload_to_space(garment_bytes, garment_ext, hf_token)
-    print(f'[VTON] model_path={model_path} garment_path={garment_path}')
+    print(f'[VTON] uploaded model={model_path} garment={garment_path}')
 
-    # Ставим задачу в очередь через Gradio queue/join
-    # fn_index=0 — process_hd (без категории, более стабильный)
+    session_hash = uuid.uuid4().hex
+
     join_payload = {
-        'fn_index': 0,
+        'fn_index': 0,  # process_hd
         'data': [
             {'path': model_path, 'orig_name': f'model.{model_ext}'},
             {'path': garment_path, 'orig_name': f'garment.{garment_ext}'},
-            1,    # n_samples
-            20,   # n_steps
-            2.0,  # image_scale
-            42,   # seed
+            1, 20, 2.0, 42,
         ],
-        'session_hash': uuid.uuid4().hex,
+        'session_hash': session_hash,
     }
 
-    join_resp = requests.post(
-        f'{SPACE_URL}/queue/join',
-        headers={**headers, 'Content-Type': 'application/json'},
-        json=join_payload,
-        timeout=30,
-    )
+    headers = {'Authorization': f'Bearer {hf_token}', 'Content-Type': 'application/json'}
+    join_resp = requests.post(f'{SPACE_URL}/queue/join', headers=headers, json=join_payload, timeout=15)
     print(f'[VTON] queue/join status={join_resp.status_code} body={join_resp.text[:200]}')
 
     if join_resp.status_code != 200:
         raise Exception(f'queue/join failed ({join_resp.status_code}): {join_resp.text[:200]}')
 
     event_id = join_resp.json().get('event_id')
-    print(f'[VTON] event_id={event_id}')
+    return {
+        'statusCode': 200,
+        'body': json.dumps({'status': 'processing', 'session_hash': session_hash, 'event_id': event_id}),
+    }
 
-    # Поллим результат через queue/data
-    session_hash = join_payload['session_hash']
-    for attempt in range(40):
-        time.sleep(3)
-        data_resp = requests.get(
-            f'{SPACE_URL}/queue/data',
-            headers=headers,
-            params={'session_hash': session_hash},
-            timeout=30,
-            stream=True,
-        )
-        print(f'[VTON] poll attempt={attempt} status={data_resp.status_code}')
 
-        if data_resp.status_code != 200:
+def action_status(body: dict, hf_token: str) -> dict:
+    """Проверяет статус задачи по session_hash, возвращает результат если готово."""
+    session_hash = body.get('session_hash')
+    if not session_hash:
+        return {'statusCode': 400, 'body': json.dumps({'error': 'Нужен session_hash'})}
+
+    headers = {'Authorization': f'Bearer {hf_token}'}
+
+    data_resp = requests.get(
+        f'{SPACE_URL}/queue/data',
+        headers=headers,
+        params={'session_hash': session_hash},
+        timeout=15,
+        stream=True,
+    )
+    print(f'[VTON] poll session={session_hash} status={data_resp.status_code}')
+
+    if data_resp.status_code != 200:
+        return {'statusCode': 200, 'body': json.dumps({'status': 'processing'})}
+
+    for raw_line in data_resp.iter_lines():
+        if not raw_line:
+            continue
+        line = raw_line.decode('utf-8') if isinstance(raw_line, bytes) else raw_line
+        if not line.startswith('data:'):
+            continue
+        try:
+            msg = json.loads(line[5:].strip())
+        except Exception:
             continue
 
-        # SSE stream — читаем построчно
-        for raw_line in data_resp.iter_lines():
-            if not raw_line:
-                continue
-            line = raw_line.decode('utf-8') if isinstance(raw_line, bytes) else raw_line
-            if not line.startswith('data:'):
-                continue
-            try:
-                msg = json.loads(line[5:].strip())
-            except Exception:
-                continue
+        msg_type = msg.get('msg')
+        print(f'[VTON] SSE msg={msg_type}')
 
-            msg_type = msg.get('msg')
-            print(f'[VTON] SSE msg={msg_type}')
+        if msg_type == 'process_completed':
+            output = msg.get('output', {})
+            all_data = output.get('data', [])
+            print(f'[VTON] output data={str(all_data)[:400]}')
 
-            if msg_type == 'process_completed':
-                output = msg.get('output', {})
-                all_data = output.get('data', [])
-                print(f'[VTON] full output data={str(all_data)[:400]}')
+            # Ищем URL/путь к изображению
+            result_url = ''
+            for item in all_data:
+                if isinstance(item, list):
+                    for sub in item:
+                        if isinstance(sub, dict):
+                            result_url = sub.get('url') or sub.get('path') or ''
+                        elif isinstance(sub, str) and sub:
+                            result_url = sub
+                        if result_url:
+                            break
+                elif isinstance(item, dict):
+                    result_url = item.get('url') or item.get('path') or ''
+                elif isinstance(item, str) and item:
+                    result_url = item
+                if result_url:
+                    break
 
-                result_url = ''
-                # Ищем URL изображения в любом месте ответа
-                for item in all_data:
-                    if isinstance(item, list):
-                        for sub in item:
-                            if isinstance(sub, dict):
-                                result_url = sub.get('url') or sub.get('path') or ''
-                            elif isinstance(sub, str) and ('http' in sub or '/tmp/' in sub or '/file=' in sub):
-                                result_url = sub
-                            if result_url:
-                                break
-                    elif isinstance(item, dict):
-                        result_url = item.get('url') or item.get('path') or ''
-                    elif isinstance(item, str) and ('http' in item or '/tmp/' in item):
-                        result_url = item
-                    if result_url:
-                        break
+            print(f'[VTON] result_url={result_url}')
 
-                print(f'[VTON] extracted result_url={result_url}')
+            if not result_url:
+                return {'statusCode': 500, 'body': json.dumps({'error': f'Space вернул пустой результат: {str(all_data)[:200]}'})}
 
-                if not result_url:
-                    raise Exception(f'Пустой результат от Space. data={str(all_data)[:200]}')
+            if not result_url.startswith('http'):
+                result_url = f'{SPACE_URL}/file={result_url}'
 
-                if not result_url.startswith('http'):
-                    result_url = f'{SPACE_URL}/file={result_url}'
+            img_bytes = requests.get(result_url, headers=headers, timeout=30).content
+            cdn_url = upload_image_to_s3(img_bytes, 'tryon-results', 'jpg')
+            return {'statusCode': 200, 'body': json.dumps({'status': 'completed', 'result_url': cdn_url})}
 
-                print(f'[VTON] downloading result from {result_url}')
-                img_resp = requests.get(result_url, headers=headers, timeout=30)
-                return upload_image_to_s3(img_resp.content, 'tryon-results', 'jpg')
+        if msg_type in ('queue_full', 'error'):
+            err = msg.get('message') or str(msg)
+            return {'statusCode': 500, 'body': json.dumps({'error': f'Space ошибка: {err}'})}
 
-            if msg_type == 'process_generating':
-                break  # ещё генерируется, продолжаем поллить
-
-            if msg_type in ('queue_full', 'error'):
-                raise Exception(f'Space вернул ошибку: {msg}')
-
-    raise Exception('Превышено время ожидания ответа от OOTDiffusion')
+    return {'statusCode': 200, 'body': json.dumps({'status': 'processing'})}
 
 
 def handler(event: dict, context) -> dict:
     """
-    Виртуальная примерка одежды через OOTDiffusion (бесплатно).
-    Сохраняет лицо, фигуру и позу человека — меняет только одежду.
+    Виртуальная примерка через OOTDiffusion (бесплатно).
+    action=start — загружает фото, ставит в очередь, возвращает session_hash
+    action=status — проверяет готовность по session_hash
+    action=save — сохраняет результат в историю
     """
     if event.get('httpMethod') == 'OPTIONS':
         return {'statusCode': 200, 'headers': CORS, 'body': ''}
 
     hf_token = os.environ.get('HF_TOKEN', '')
     if not hf_token:
-        return {
-            'statusCode': 500,
-            'headers': {'Access-Control-Allow-Origin': '*'},
-            'body': json.dumps({'error': 'HF_TOKEN не настроен'}),
-        }
+        return {'statusCode': 500, 'headers': {'Access-Control-Allow-Origin': '*'},
+                'body': json.dumps({'error': 'HF_TOKEN не настроен'})}
 
     body = json.loads(event.get('body') or '{}')
     action = body.get('action', 'run')
 
-    if action == 'run':
-        model_data = body.get('model_image')
-        garment_data = body.get('garment_image')
-        category = body.get('category', 'tops')
+    try:
+        if action in ('run', 'start'):
+            result = action_start(body, hf_token)
+        elif action == 'status':
+            result = action_status(body, hf_token)
+        elif action == 'save':
+            image_url = body.get('image_url')
+            if not image_url:
+                result = {'statusCode': 400, 'body': json.dumps({'error': 'Нужен image_url'})}
+            else:
+                img_bytes = requests.get(image_url, timeout=30).content
+                cdn_url = upload_image_to_s3(img_bytes, 'tryon-history', 'jpg')
+                result = {'statusCode': 200, 'body': json.dumps({'saved_url': cdn_url})}
+        else:
+            result = {'statusCode': 400, 'body': json.dumps({'error': f'Неизвестное действие: {action}'})}
+    except Exception as e:
+        print(f'[VTON] ERROR: {e}')
+        result = {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
 
-        if not model_data or not garment_data:
-            return {
-                'statusCode': 400,
-                'headers': {'Access-Control-Allow-Origin': '*'},
-                'body': json.dumps({'error': 'Нужны model_image и garment_image'}),
-            }
-
-        result_url = run_vton(model_data, garment_data, category, hf_token)
-
-        return {
-            'statusCode': 200,
-            'headers': {'Access-Control-Allow-Origin': '*'},
-            'body': json.dumps({'status': 'completed', 'result_url': result_url}),
-        }
-
-    elif action == 'save':
-        image_url = body.get('image_url')
-        if not image_url:
-            return {
-                'statusCode': 400,
-                'headers': {'Access-Control-Allow-Origin': '*'},
-                'body': json.dumps({'error': 'Нужен image_url'}),
-            }
-        img_bytes = requests.get(image_url, timeout=30).content
-        cdn_url = upload_image_to_s3(img_bytes, 'tryon-history', 'jpg')
-        return {
-            'statusCode': 200,
-            'headers': {'Access-Control-Allow-Origin': '*'},
-            'body': json.dumps({'saved_url': cdn_url}),
-        }
-
-    return {
-        'statusCode': 400,
-        'headers': {'Access-Control-Allow-Origin': '*'},
-        'body': json.dumps({'error': f'Неизвестное действие: {action}'}),
-    }
+    result['headers'] = {'Access-Control-Allow-Origin': '*'}
+    return result
