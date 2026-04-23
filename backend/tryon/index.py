@@ -6,13 +6,16 @@ import boto3
 import uuid
 import time
 
-CORS = {'Access-Control-Allow-Origin': '*'}
-YANDEX_API_KEY = None  # берём из os.environ
+CORS = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, X-User-Id, X-Auth-Token, X-Session-Id',
+}
 
-# Endpoints Yandex AI Studio (совместимы с OpenAI API)
-TEXT_API = 'https://llm.api.cloud.yandex.net/v1/chat/completions'
-IMAGE_API = 'https://llm.api.cloud.yandex.net/foundationModels/v1/imageGenerationAsync'
-OPERATION_API = 'https://llm.api.cloud.yandex.net/operations'
+REPLICATE_API = 'https://api.replicate.com/v1'
+# IDM-VTON — специализированная модель виртуальной примерки одежды
+# Сохраняет лицо, фигуру и позу человека, меняет только одежду
+VTON_MODEL = 'cuuupid/idm-vton:c871bb9b046607b680449ecbae55fd8c6d945e0a1948644bf2361b3d021d3ff4'
 
 
 def s3_client():
@@ -24,193 +27,170 @@ def s3_client():
     )
 
 
-def upload_base64_to_s3(data_url: str, folder: str) -> str:
-    header, b64data = data_url.split(',', 1)
-    ext = 'png' if 'png' in header else 'jpg'
-    img_bytes = base64.b64decode(b64data)
+def data_url_to_base64(data_url: str) -> str:
+    if ',' in data_url:
+        return data_url.split(',', 1)[1]
+    return data_url
+
+
+def upload_image_to_s3(img_bytes: bytes, folder: str, ext: str = 'png') -> str:
     file_key = f'{folder}/{uuid.uuid4()}.{ext}'
     s3 = s3_client()
     s3.put_object(Bucket='files', Key=file_key, Body=img_bytes, ContentType=f'image/{ext}')
     return f"https://cdn.poehali.dev/projects/{os.environ['AWS_ACCESS_KEY_ID']}/bucket/{file_key}"
 
 
-def get_pure_base64(data_url: str) -> str:
-    """Возвращает чистый base64 без data:image/...;base64, префикса."""
-    if ',' in data_url:
-        return data_url.split(',', 1)[1]
-    return data_url
+def upload_dataurl_to_s3(data_url: str, folder: str) -> str:
+    header, b64data = data_url.split(',', 1)
+    ext = 'png' if 'png' in header else 'jpg'
+    img_bytes = base64.b64decode(b64data)
+    return upload_image_to_s3(img_bytes, folder, ext)
 
 
-def describe_and_generate(model_b64: str, garment_b64: str, category: str, api_key: str, folder_id: str) -> str:
+def run_vton(model_image_url: str, garment_image_url: str, category: str, api_key: str) -> str:
     """
-    Шаг 1: Gemma 3 27B смотрит на фото человека и одежды,
-            составляет точный промпт для генерации.
-    Шаг 2: YandexART генерирует итоговое изображение по промпту.
+    Запускает IDM-VTON через Replicate.
+    Модель сохраняет лицо, телосложение и позу человека,
+    заменяя только одежду на указанную.
     Возвращает URL готового изображения.
     """
+    cat_map = {
+        'tops': 'upper_body',
+        'bottoms': 'lower_body',
+        'dresses': 'dresses',
+        'upper_body': 'upper_body',
+        'lower_body': 'lower_body',
+    }
+    garment_desc_map = {
+        'upper_body': 'upper body clothing item',
+        'lower_body': 'lower body clothing item',
+        'dresses': 'dress or full body outfit',
+    }
+    vton_category = cat_map.get(category, 'upper_body')
+    garment_desc = garment_desc_map.get(vton_category, 'clothing item')
+
     headers = {
-        'Authorization': f'Api-Key {api_key}',
+        'Authorization': f'Token {api_key}',
         'Content-Type': 'application/json',
+        'Prefer': 'wait',
     }
 
-    # ── Шаг 1: анализ двух фото через Gemma 3 27B ─────────────────────────
-    text_payload = {
-        'model': f'gpt://{folder_id}/gemma-3-27b-it',
-        'messages': [
-            {
-                'role': 'user',
-                'content': [
-                    {
-                        'type': 'text',
-                        'text': (
-                            'Ты помогаешь создать промпт для нейросети виртуальной примерки одежды.\n'
-                            'Первое изображение — человек (модель). Второе изображение — одежда.\n\n'
-                            'Опиши подробно:\n'
-                            '1. Внешность человека: пол, телосложение, цвет волос, цвет кожи, поза\n'
-                            '2. Одежду: тип, цвет, фасон, материал, детали\n\n'
-                            'Затем напиши финальный промпт на английском языке для YandexART:\n'
-                            '"A photo of [описание человека] wearing [описание одежды], '
-                            'studio lighting, fashion photography, high quality, realistic"\n\n'
-                            'Верни ТОЛЬКО финальный промпт на английском, без объяснений.'
-                        ),
-                    },
-                    {
-                        'type': 'image_url',
-                        'image_url': {
-                            'url': f'data:image/jpeg;base64,{get_pure_base64(model_b64)}'
-                        },
-                    },
-                    {
-                        'type': 'image_url',
-                        'image_url': {
-                            'url': f'data:image/jpeg;base64,{get_pure_base64(garment_b64)}'
-                        },
-                    },
-                ],
-            }
-        ],
-        'max_tokens': 300,
-    }
-
-    print('[STEP 1] Calling Gemma 3 27B for prompt generation...')
-    text_resp = requests.post(TEXT_API, json=text_payload, headers=headers, timeout=30)
-    print(f'[STEP 1] status={text_resp.status_code} body={text_resp.text[:400]}')
-
-    if text_resp.status_code != 200:
-        raise Exception(f'Gemma API ошибка ({text_resp.status_code}): {text_resp.text[:300]}')
-
-    text_data = text_resp.json()
-    art_prompt = text_data['choices'][0]['message']['content'].strip()
-    print(f'[STEP 1] Generated prompt: {art_prompt}')
-
-    # ── Шаг 2: генерация через YandexART ──────────────────────────────────
-    image_payload = {
-        'modelUri': f'art://{folder_id}/yandex-art/latest',
-        'generationOptions': {
-            'seed': str(int(time.time()) % 10000),
-            'aspectRatio': {'widthRatio': '3', 'heightRatio': '4'},
+    payload = {
+        'version': VTON_MODEL.split(':')[1],
+        'input': {
+            'human_img': model_image_url,
+            'garm_img': garment_image_url,
+            'garment_des': garment_desc,
+            'category': vton_category,
+            'is_checked': True,
+            'is_checked_crop': False,
+            'denoise_steps': 30,
+            'seed': 42,
         },
-        'messages': [
-            {'weight': '1', 'text': art_prompt}
-        ],
     }
 
-    print('[STEP 2] Calling YandexART...')
-    img_resp = requests.post(IMAGE_API, json=image_payload, headers=headers, timeout=30)
-    print(f'[STEP 2] status={img_resp.status_code} body={img_resp.text[:400]}')
+    print(f'[VTON] Starting IDM-VTON prediction, category={vton_category}')
+    resp = requests.post(
+        f'{REPLICATE_API}/predictions',
+        json=payload,
+        headers=headers,
+        timeout=120,
+    )
+    print(f'[VTON] status={resp.status_code} body={resp.text[:500]}')
 
-    if img_resp.status_code != 200:
-        raise Exception(f'YandexART ошибка ({img_resp.status_code}): {img_resp.text[:300]}')
+    if resp.status_code not in (200, 201):
+        raise Exception(f'Replicate API ошибка ({resp.status_code}): {resp.text[:300]}')
 
-    operation_id = img_resp.json().get('id')
-    if not operation_id:
-        raise Exception(f'Не получен operation_id: {img_resp.text[:200]}')
+    data = resp.json()
 
-    # ── Шаг 3: ждём результата операции ───────────────────────────────────
-    for attempt in range(30):
-        time.sleep(3)
-        op_resp = requests.get(
-            f'{OPERATION_API}/{operation_id}',
-            headers=headers,
-            timeout=15,
-        )
-        op_data = op_resp.json()
-        print(f'[STEP 3] attempt={attempt} done={op_data.get("done")}')
+    # Если Prefer: wait не сработал — поллим вручную
+    if data.get('status') not in ('succeeded', 'failed', 'canceled'):
+        prediction_id = data['id']
+        poll_url = f'{REPLICATE_API}/predictions/{prediction_id}'
+        for attempt in range(60):
+            time.sleep(3)
+            poll_resp = requests.get(poll_url, headers=headers, timeout=15)
+            data = poll_resp.json()
+            print(f'[VTON] poll attempt={attempt} status={data.get("status")}')
+            if data.get('status') in ('succeeded', 'failed', 'canceled'):
+                break
 
-        if op_data.get('done'):
-            if 'error' in op_data:
-                raise Exception(f'YandexART error: {op_data["error"]}')
-            img_b64 = op_data['response']['image']
-            # Сохраняем в S3
-            img_bytes = base64.b64decode(img_b64)
-            file_key = f'tryon-results/{uuid.uuid4()}.jpeg'
-            s3 = s3_client()
-            s3.put_object(Bucket='files', Key=file_key, Body=img_bytes, ContentType='image/jpeg')
-            return f"https://cdn.poehali.dev/projects/{os.environ['AWS_ACCESS_KEY_ID']}/bucket/{file_key}"
+    if data.get('status') == 'failed':
+        raise Exception(f'IDM-VTON завершился с ошибкой: {data.get("error")}')
 
-    raise Exception('YandexART: превышено время ожидания генерации')
+    output = data.get('output')
+    if not output:
+        raise Exception('IDM-VTON не вернул результат')
+
+    result_url = output if isinstance(output, str) else output[0]
+
+    # Сохраняем результат в S3
+    img_bytes = requests.get(result_url, timeout=30).content
+    cdn_url = upload_image_to_s3(img_bytes, 'tryon-results', 'jpg')
+    return cdn_url
 
 
 def handler(event: dict, context) -> dict:
     """
-    Виртуальная примерка через Yandex AI:
-    1. Gemma 3 27B анализирует фото человека и одежды, составляет промпт
-    2. YandexART генерирует финальное изображение по промпту
+    Виртуальная примерка одежды через Replicate IDM-VTON.
+    Сохраняет лицо, фигуру и позу человека — меняет только одежду.
     """
     if event.get('httpMethod') == 'OPTIONS':
-        return {
-            'statusCode': 200,
-            'headers': {
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-                'Access-Control-Allow-Headers': 'Content-Type, X-User-Id, X-Auth-Token, X-Session-Id',
-                'Access-Control-Max-Age': '86400',
-            },
-            'body': '',
-        }
+        return {'statusCode': 200, 'headers': CORS, 'body': ''}
 
-    api_key = os.environ.get('YANDEX_API_KEY', '')
+    api_key = os.environ.get('REPLICATE_API_KEY', '')
     if not api_key:
-        return {'statusCode': 500, 'headers': CORS,
-                'body': json.dumps({'error': 'YANDEX_API_KEY не настроен'})}
-
-    folder_id = os.environ.get('YANDEX_FOLDER_ID', '')
-    if not folder_id:
-        return {'statusCode': 500, 'headers': CORS,
-                'body': json.dumps({'error': 'YANDEX_FOLDER_ID не настроен'})}
+        return {
+            'statusCode': 500,
+            'headers': {'Access-Control-Allow-Origin': '*'},
+            'body': json.dumps({'error': 'REPLICATE_API_KEY не настроен'}),
+        }
 
     body = json.loads(event.get('body') or '{}')
     action = body.get('action', 'run')
 
     if action == 'run':
-        model_b64 = body.get('model_image')
-        garment_b64 = body.get('garment_image')
-        category = body.get('category', 'tops')
+        model_data = body.get('model_image')
+        garment_data = body.get('garment_image')
+        category = body.get('category', 'upper_body')
 
-        if not model_b64 or not garment_b64:
-            return {'statusCode': 400, 'headers': CORS,
-                    'body': json.dumps({'error': 'Нужны model_image и garment_image'})}
+        if not model_data or not garment_data:
+            return {
+                'statusCode': 400,
+                'headers': {'Access-Control-Allow-Origin': '*'},
+                'body': json.dumps({'error': 'Нужны model_image и garment_image'}),
+            }
 
-        result_url = describe_and_generate(model_b64, garment_b64, category, api_key, folder_id)
+        # Загружаем оба изображения в S3, чтобы Replicate мог их скачать по URL
+        model_url = upload_dataurl_to_s3(model_data, 'tryon-input')
+        garment_url = upload_dataurl_to_s3(garment_data, 'tryon-input')
+
+        result_url = run_vton(model_url, garment_url, category, api_key)
 
         return {
             'statusCode': 200,
-            'headers': CORS,
+            'headers': {'Access-Control-Allow-Origin': '*'},
             'body': json.dumps({'status': 'completed', 'result_url': result_url}),
         }
 
     elif action == 'save':
         image_url = body.get('image_url')
         if not image_url:
-            return {'statusCode': 400, 'headers': CORS,
-                    'body': json.dumps({'error': 'Нужен image_url'})}
+            return {
+                'statusCode': 400,
+                'headers': {'Access-Control-Allow-Origin': '*'},
+                'body': json.dumps({'error': 'Нужен image_url'}),
+            }
         img_bytes = requests.get(image_url, timeout=30).content
-        file_key = f'tryon-history/{uuid.uuid4()}.jpg'
-        s3 = s3_client()
-        s3.put_object(Bucket='files', Key=file_key, Body=img_bytes, ContentType='image/jpeg')
-        cdn_url = f"https://cdn.poehali.dev/projects/{os.environ['AWS_ACCESS_KEY_ID']}/bucket/{file_key}"
-        return {'statusCode': 200, 'headers': CORS,
-                'body': json.dumps({'saved_url': cdn_url})}
+        cdn_url = upload_image_to_s3(img_bytes, 'tryon-history', 'jpg')
+        return {
+            'statusCode': 200,
+            'headers': {'Access-Control-Allow-Origin': '*'},
+            'body': json.dumps({'saved_url': cdn_url}),
+        }
 
-    return {'statusCode': 400, 'headers': CORS,
-            'body': json.dumps({'error': 'Неизвестный action'})}
+    return {
+        'statusCode': 400,
+        'headers': {'Access-Control-Allow-Origin': '*'},
+        'body': json.dumps({'error': f'Неизвестное действие: {action}'}),
+    }
